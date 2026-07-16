@@ -2,10 +2,7 @@
 
 This is a local Streamlit dashboard for the CGM thesis project. It focuses on the enriched multimodal dataset and Experiment C split validation: participant-level enriched features, train/validation/test repartition, context/adaptation/evaluation timelines, and selected participant time series.
 
-## Inspiration
 
-- Conceptual preprocessing-dashboard motivation: https://github.com/shakson-isaac/T1DEXIpreprocess
-- Visual inspiration only: https://biodelphis.ch/
 
 No code, content, or folder structure is copied from either reference.
 
