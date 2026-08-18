@@ -68,6 +68,23 @@ from plots import (
 
 st.set_page_config(page_title="AI-READI Dashboard", page_icon="CGM", layout="wide")
 
+
+def _require_password() -> None:
+    if st.session_state.get("dashboard_authenticated", False):
+        return
+    st.title("AI-READI Dashboard")
+    password = st.text_input("Password", type="password")
+    if not password:
+        st.stop()
+    if password != st.secrets["dashboard_password"]:
+        st.error("Incorrect password.")
+        st.stop()
+    st.session_state["dashboard_authenticated"] = True
+    st.rerun()
+
+
+_require_password()
+
 st.markdown('''
 <style>
 :root { --red:#BA2828; --blue:#003366; --teal:#5BBABA; --hot:#FF0000; --gray:#888888; --panel:rgba(248,251,252,.84); }
