@@ -8,42 +8,51 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from config import COLUMN_LABELS, SIGNAL_COLUMNS
+from config import (
+    CANONICAL_STREAM_CHECKPOINT_VAL_PINBALL_MGDL,
+    COLUMN_LABELS,
+    PERSONALIZATION_WARMUP_HOURS,
+    SIGNAL_COLUMNS,
+    STREAM_TIMELINE_SIGNAL,
+    T2D_SUBTYPE_CLUSTER_COLORS,
+    T2D_SUBTYPE_CLUSTER_INTERPRETATION,
+    T2D_SUBTYPE_CLUSTER_ORDER,
+    T2D_SUBTYPE_FACTOR_COLUMNS,
+)
 from data_loader import (
+    CGM_SEGMENT_GAP_MINUTES,
     check_file_availability,
     detect_timestamp_column,
+    load_canonical_stream_split,
     load_cohort,
     load_cohort_selection_metadata,
     load_cgm_participant_metrics,
-    load_forecast_windows,
-    load_forecast_windows_with_split,
+    load_forecast_anchors,
     load_measurements_long,
     load_medications_long,
     load_original_condition_groups,
     load_original_participants,
     load_participant_timeseries,
-    load_personalization_windows,
     load_segments,
-    load_split_participants,
-    load_split_summary,
     load_static_features,
+    load_stream_summary,
+    load_t2d_subtype_clinical_factors,
     multimodal_metadata,
+    segment_boundaries,
 )
 from metrics import participant_time_stats
 from plots import (
-    phase_summary,
     plot_clinical_scatter,
+    plot_cluster_box_strip,
     plot_coprescription_heatmap,
     plot_crosstab_heatmap,
     plot_correlation_matrix,
-    plot_forecast_window,
     plot_histogram,
     plot_hba1c_vs_med_count,
     plot_missingness,
     plot_medication_burden,
     plot_medication_prevalence_by_stratum,
     plot_kde_curves,
-    plot_participant_timeline,
     plot_population_violin,
     plot_preprocessing_pipeline,
     plot_proportion_bar,
@@ -53,7 +62,6 @@ from plots import (
     plot_stacked_histogram,
     plot_stacked_proportion,
     plot_static_feature_table,
-    plot_windows_per_participant,
     pretty_group,
     pretty_split,
 )
@@ -428,12 +436,9 @@ def pipeline_stage_visual(pipeline_df: pd.DataFrame, selected_stage: str) -> Non
     if pipeline_df.empty or selected_stage not in pipeline_df["Stage"].tolist():
         return
     row = pipeline_df[pipeline_df["Stage"] == selected_stage].iloc[0]
-    stage_name = str(row.get("Stage", ""))
     context_label = str(row.get("Participant context", "Participants retained"))
-    change_label = "Training participants" if stage_name == "Personalization split" else "Participant change"
     chips = [
-        (change_label, row.get("Participants lost from previous step", "-")),
-        ("Windows", row.get("Windows", "-")),
+        ("Participant change", row.get("Participants lost from previous step", "-")),
     ]
     chips_html = ''.join(
         f'<div class="pipeline-chip">{escape(label)}: {escape(fmt(value))}</div>'
@@ -527,6 +532,15 @@ def add_ethnicity_label(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def add_tg_hdl_ratio(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if {"triglycerides_mgdl_baseline", "hdl_cholesterol_mgdl_baseline"}.issubset(out.columns):
+        triglycerides = pd.to_numeric(out["triglycerides_mgdl_baseline"], errors="coerce")
+        hdl = pd.to_numeric(out["hdl_cholesterol_mgdl_baseline"], errors="coerce").replace(0, np.nan)
+        out["tg_hdl_ratio"] = triglycerides / hdl
+    return out
+
+
 def attach_original_condition_sources(demo_df: pd.DataFrame, participants_tsv: pd.DataFrame, condition_groups: pd.DataFrame) -> pd.DataFrame:
     out = demo_df.copy()
     if "participant_id" in out.columns:
@@ -567,7 +581,7 @@ def split_counts(df: pd.DataFrame) -> pd.DataFrame:
 def enrich_participant_table(cohort: pd.DataFrame, split_df: pd.DataFrame) -> pd.DataFrame:
     if cohort.empty or "participant_id" not in cohort.columns:
         return pd.DataFrame()
-    cols = [c for c in ["participant_id", "study_group", "stratum", "clinical_site", "age", "BMI", "HbA1c", "n_valid_windows", "n_segments", "total_clean_dur_h", "longest_seg_h", "personalization_eligible"] if c in cohort.columns]
+    cols = [c for c in ["participant_id", "study_group", "stratum", "clinical_site", "age", "BMI", "HbA1c", "n_segments", "total_clean_dur_h", "longest_seg_h", "personalization_eligible"] if c in cohort.columns]
     table = cohort[cols].copy()
     if "study_group" not in table.columns and "stratum" in table.columns:
         table["study_group"] = table["stratum"]
@@ -583,7 +597,6 @@ def enrich_participant_table(cohort: pd.DataFrame, split_df: pd.DataFrame) -> pd
         "age": "Age [years]",
         "BMI": "BMI [kg/m2]",
         "HbA1c": "HbA1c [%]",
-        "n_valid_windows": "Valid forecast windows",
         "n_segments": "Clean segments",
         "total_clean_dur_h": "Clean duration [h]",
         "longest_seg_h": "Longest clean segment [h]",
@@ -598,84 +611,12 @@ def selected_row(df: pd.DataFrame, participant_id: str) -> pd.Series:
     return rows.iloc[0] if not rows.empty else pd.Series(dtype=object)
 
 
-def personalization_source(split_name: str) -> tuple[pd.DataFrame, str]:
-    val = load_personalization_windows("val")
-    test = load_personalization_windows("test")
-    if split_name == "Validation":
-        return val, "validation personalization windows"
-    if split_name == "Test":
-        return test, "test personalization windows"
-    return pd.concat([val, test], ignore_index=True), "validation + test personalization windows"
-
-
-def build_phase_table(participant_id: str, split_name: str, adaptation_hours: int) -> tuple[pd.DataFrame, str]:
-    if split_name == "Train":
-        return pd.DataFrame(), (
-            "Training participants do not have adaptation/evaluation phases. "
-            "Only validation and test participants are split into context, adaptation, and evaluation."
-        )
-    pers, source = personalization_source(split_name)
-    if not pers.empty and "participant_id" in pers.columns:
-        row = pers[pers["participant_id"].astype(str) == str(participant_id)].head(1)
-        if not row.empty:
-            row = row.iloc[0]
-            context_start = pd.to_datetime(row.get("context_start_abs"), errors="coerce")
-            adaptation_start = pd.to_datetime(row.get("adaptation_start_abs"), errors="coerce")
-            original_adaptation_end = pd.to_datetime(row.get("adaptation_end_abs"), errors="coerce")
-            evaluation_end = pd.to_datetime(row.get("evaluation_end_abs"), errors="coerce")
-            if pd.notna(context_start) and pd.notna(adaptation_start) and pd.notna(evaluation_end):
-                adaptation_end = adaptation_start + pd.Timedelta(hours=int(adaptation_hours))
-                if pd.notna(original_adaptation_end) and adaptation_end > original_adaptation_end:
-                    adaptation_end = original_adaptation_end
-                rows = [{"phase": "Context", "start": context_start, "end": adaptation_start}]
-                if adaptation_hours > 0 and adaptation_end > adaptation_start:
-                    rows.append({"phase": "Adaptation", "start": adaptation_start, "end": adaptation_end})
-                if evaluation_end > adaptation_end:
-                    rows.append({"phase": "Evaluation", "start": adaptation_end, "end": evaluation_end})
-                return pd.DataFrame(rows), f"Using explicit absolute timestamps from {source}. The adaptation selector moves the displayed adaptation/evaluation boundary for visual QA."
-    if not windows_split.empty and "participant_id" in windows_split.columns:
-        p = windows_split[windows_split["participant_id"].astype(str) == str(participant_id)].copy()
-        if not p.empty and {"window_start", "window_end"}.issubset(p.columns):
-            start = pd.to_datetime(p["window_start"], errors="coerce").min()
-            end = pd.to_datetime(p["window_end"], errors="coerce").max()
-            if pd.notna(start) and pd.notna(end):
-                adapt_start = start + pd.Timedelta(hours=48)
-                adapt_end = adapt_start + pd.Timedelta(hours=int(adaptation_hours))
-                return pd.DataFrame([
-                    {"phase": "Context", "start": start, "end": min(adapt_start, end)},
-                    {"phase": "Adaptation", "start": min(adapt_start, end), "end": min(adapt_end, end)},
-                    {"phase": "Evaluation", "start": min(adapt_end, end), "end": end},
-                ]), "No explicit personalization timestamps were found; phases are inferred from split-window bounds."
-    return pd.DataFrame(), "No context/adaptation/evaluation timing could be found for this participant."
-
 
 def feature_group(static_row: pd.DataFrame, keywords: list[str], query: str = "") -> pd.DataFrame:
     if static_row.empty:
         return pd.DataFrame(columns=["Feature", "Value"])
     cols = [c for c in static_row.columns if any(k in c.lower() for k in keywords)]
     return plot_static_feature_table(static_row[cols], query=query) if cols else pd.DataFrame(columns=["Feature", "Value"])
-
-
-def participant_forecast_windows(participant_id: str, split_label: str) -> pd.DataFrame:
-    sources = []
-    if not windows_split.empty and "participant_id" in windows_split.columns:
-        sources.append(windows_split.copy())
-    if not forecast_windows.empty and "participant_id" in forecast_windows.columns:
-        sources.append(forecast_windows.copy())
-    for source in sources:
-        df = source[source["participant_id"].astype(str) == str(participant_id)].copy()
-        if df.empty or not {"window_start", "window_end"}.issubset(df.columns):
-            continue
-        if "split" in df.columns and split_label in {"Train", "Validation", "Test"}:
-            split_map = df["split"].map(pretty_split)
-            split_filtered = df[split_map == split_label]
-            if not split_filtered.empty:
-                df = split_filtered
-        sort_cols = [c for c in ["segment_id", "window_start", "window_end"] if c in df.columns]
-        return df.sort_values(sort_cols).reset_index(drop=True)
-    return pd.DataFrame()
-
-
 
 
 def build_pipeline_summary() -> pd.DataFrame:
@@ -688,30 +629,10 @@ def build_pipeline_summary() -> pd.DataFrame:
     after_trim = counts.get("after_trim")
     after_segmentation = counts.get("after_segmentation")
     total_segments = counts.get("total_segments", len(segments) if not segments.empty else None)
-    total_windows = counts.get("total_forecast_windows", len(forecast_windows) if not forecast_windows.empty else None)
-
-    windows_participants = forecast_windows["participant_id"].nunique() if "participant_id" in forecast_windows.columns else after_segmentation
-    split_participant_count = split_participants["participant_id"].nunique() if "participant_id" in split_participants.columns else 0
-    train_participant_count = 0
-    val_participant_count = 0
-    test_participant_count = 0
-    if {"participant_id", "split"}.issubset(split_participants.columns):
-        split_labels = split_participants["split"].map(pretty_split)
-        train_participant_count = int((split_labels == "Train").sum())
-        val_participant_count = int((split_labels == "Validation").sum())
-        test_participant_count = int((split_labels == "Test").sum())
-    val_p = load_personalization_windows("val")
-    test_p = load_personalization_windows("test")
-    personalization_participants = 0
-    if not val_p.empty and "participant_id" in val_p.columns:
-        personalization_participants += val_p["participant_id"].nunique()
-    if not test_p.empty and "participant_id" in test_p.columns:
-        personalization_participants += test_p["participant_id"].nunique()
 
     min_duration_h = config.get("min_duration_h", 108)
     context_h = config.get("context_h", 48)
     target_h = config.get("target_h", 1)
-    stride_h = config.get("stride_h", 1)
     gap = config.get("gap_thresholds_min", {}) or {}
     trim_bins = config.get("trim_window_bins", 12)
     trim_threshold = config.get("trim_miss_threshold", 0.20)
@@ -721,58 +642,32 @@ def build_pipeline_summary() -> pd.DataFrame:
         {
             "Stage": "Raw enriched data",
             "Participants": raw_n or "-",
-            "Windows": "-",
             "Examples": f"Input parquet: {Path(str(input_parquet)).name}",
             "Thresholds / rule": "Before cohort selection; enriched CGM, HR, RR, activity, and static clinical features are available.",
         },
         {
             "Stage": "Duration floor",
             "Participants": after_duration or "-",
-            "Windows": "-",
             "Examples": f"Retains participants with at least {float(min_duration_h):.0f} hours of raw coverage.",
-            "Thresholds / rule": f">= {float(min_duration_h):.0f} h = {context_h} h context + 48 h adaptation + 12 h minimum evaluation.",
+            "Thresholds / rule": f">= {float(min_duration_h):.0f} h of raw coverage, enough to support a full streamed history per participant.",
         },
         {
             "Stage": "Boundary trimming",
             "Participants": after_trim or "-",
-            "Windows": "-",
             "Examples": "Trims leading/trailing bins where missingness is high before clean segmentation.",
             "Thresholds / rule": f"{trim_bins} bins rolling window ({trim_bins * 5 / 60:.1f} h), missingness threshold {float(trim_threshold) * 100:.0f}%.",
         },
         {
             "Stage": "Gap segmentation",
             "Participants": after_segmentation or "-",
-            "Windows": "-",
-            "Examples": f"{fmt(total_segments)} clean segments retained across participants.",
-            "Thresholds / rule": f"Split at long gaps: CGM > {gap.get('cgm', 30)} min; HR/RR/activity > {gap.get('hr', 60)} min; keep segments >= {context_h + target_h} h.",
+            "Examples": f"{fmt(total_segments)} clean segments retained across participants, each streamed continuously.",
+            "Thresholds / rule": f"Split at long gaps: CGM > {gap.get('cgm', 30)} min; HR/RR/activity > {gap.get('hr', 60)} min; keep segments >= {context_h + target_h} h of streamed coverage.",
         },
         {
             "Stage": "Imputation",
             "Participants": after_segmentation or "-",
-            "Windows": "-",
             "Examples": "CGM, HR, and RR are linearly interpolated inside retained clean segments; activity is zero-filled.",
-            "Thresholds / rule": "Imputation is constrained by the same modality gap thresholds; windows with remaining CGM NaNs are not forecastable.",
-        },
-        {
-            "Stage": "Forecast-window extraction",
-            "Participants": windows_participants or "-",
-            "Windows": fmt(total_windows) if total_windows is not None else "-",
-            "Examples": "Each sample is a sliding 48 h multimodal history followed by a 1 h CGM target.",
-            "Thresholds / rule": f"Context {context_h} h -> target {target_h} h, stride {stride_h} h.",
-        },
-        {
-            "Stage": "Experiment C participant split",
-            "Participants": split_participant_count or "-",
-            "Windows": f"{len(windows_split):,}" if not windows_split.empty else "-",
-            "Examples": f"Train: {train_participant_count:,}; validation: {val_participant_count:,}; test: {test_participant_count:,} participants.",
-            "Thresholds / rule": "Participant-level split prevents train/validation/test leakage; no participants are removed at this stage.",
-        },
-        {
-            "Stage": "Personalization split",
-            "Participants": personalization_participants or "-",
-            "Windows": f"{len(val_p) + len(test_p):,}" if (not val_p.empty or not test_p.empty) else "-",
-            "Examples": f"Validation + test participants: {personalization_participants:,}; train participants remain used for model training: {train_participant_count:,}.",
-            "Thresholds / rule": "Only validation/test participants enter personalization evaluation; train participants are not discarded, they are used for training and therefore do not have adaptation/evaluation phases.",
+            "Thresholds / rule": "Imputation is constrained by the same modality gap thresholds; segments with remaining CGM NaNs are not streamable.",
         },
     ]
     out = pd.DataFrame(rows)
@@ -786,89 +681,22 @@ def build_pipeline_summary() -> pd.DataFrame:
             prev = numeric
 
     out["Participant context"] = "Participants retained"
-    out.loc[out["Stage"] == "Experiment C participant split", "Participant context"] = "Participants assigned to train/validation/test"
-    out.loc[out["Stage"] == "Personalization split", "Participant context"] = "Validation/test participants used for personalization evaluation"
-    out.loc[out["Stage"] == "Experiment C participant split", "Participants lost from previous step"] = "0; split only"
-    out.loc[out["Stage"] == "Personalization split", "Participants lost from previous step"] = f"{train_participant_count:,} train participants used for training"
     return out
-
-def forecast_window_summary(window_df: pd.DataFrame, selected_position: int, bin_minutes: float, target_hours: float) -> list[tuple[str, object]]:
-    if window_df.empty or not {"window_start", "window_end"}.issubset(window_df.columns):
-        return []
-    df = window_df.copy().reset_index(drop=True)
-    selected_position = int(max(0, min(selected_position, len(df) - 1)))
-    row = df.iloc[selected_position]
-    start_bin = float(pd.to_numeric(row["window_start"], errors="coerce"))
-    end_bin = float(pd.to_numeric(row["window_end"], errors="coerce"))
-    target_bins = max(1.0, float(target_hours) * 60.0 / float(bin_minutes))
-    context_bins = max(0.0, (end_bin - start_bin) - target_bins)
-    starts = pd.to_numeric(df["window_start"], errors="coerce").dropna().sort_values()
-    stride_bins = starts.diff().dropna().median() if len(starts) > 1 else np.nan
-    stride_h = stride_bins * bin_minutes / 60.0 if pd.notna(stride_bins) else np.nan
-    window_h = (end_bin - start_bin) * bin_minutes / 60.0
-    participant_duration_h = pd.to_numeric(df["window_end"], errors="coerce").max() * bin_minutes / 60.0
-    return [
-        ("Forecast windows", len(df)),
-        ("Participant duration", f"{participant_duration_h:.1f} h"),
-        ("Window index", selected_position),
-        ("Context", f"{context_bins * bin_minutes / 60.0:.1f} h"),
-        ("Target", f"{float(target_hours):.1f} h"),
-        ("Prediction timestamp", f"{end_bin * bin_minutes / 60.0:.1f} h from start"),
-        ("Stride", f"{stride_h:.1f} h" if pd.notna(stride_h) else "-"),
-        ("Window overlap", f"{window_h - stride_h:.1f} h" if pd.notna(stride_h) else "-"),
-    ]
-
-
-def render_forecast_window_schematic(context_hours: float, target_hours: float, stride_hours: float) -> None:
-    total = float(context_hours) + float(target_hours)
-    context_pct = max(1.0, float(context_hours) / total * 100.0)
-    target_pct = max(1.0, float(target_hours) / total * 100.0)
-    overlap = max(0.0, total - float(stride_hours))
-    prediction_ts = total
-    html = f"""
-    <div class="forecast-method-card">
-      <div class="forecast-bar-wrap">
-        <div class="forecast-bar">
-          <div class="forecast-context" style="width:{context_pct:.3f}%">{context_hours:g}h context</div>
-          <div class="forecast-target" style="width:{target_pct:.3f}%">{target_hours:g}h target</div>
-        </div>
-        <div class="forecast-arrow" style="left:{context_pct:.3f}%">
-          <div class="arrow-line"></div>
-          <div class="arrow-label">prediction timestamp<br>{prediction_ts:g}h from window start</div>
-        </div>
-      </div>
-      <div class="forecast-equation">
-        <span>One sample</span>
-        <b>{context_hours:g}h multimodal history</b>
-        <span>→</span>
-        <b>predict next {target_hours:g}h CGM</b>
-      </div>
-      <div class="forecast-method-grid">
-        <div><b>Context</b><span>{context_hours:g} h</span></div>
-        <div><b>Target</b><span>{target_hours:g} h</span></div>
-        <div><b>Stride</b><span>{stride_hours:g} h</span></div>
-        <div><b>Window overlap</b><span>{overlap:g} h</span></div>
-      </div>
-      <pre class="forecast-ascii">|{'-' * 27}{context_hours:g}h context{'-' * 27}|--{target_hours:g}h target--|
-{' ' * 62}↑
-{' ' * 49}prediction timestamp</pre>
-    </div>
-    """
-    st.markdown(html, unsafe_allow_html=True)
 
 
 availability = check_file_availability()
 cohort = load_cohort()
 segments = load_segments()
-forecast_windows = load_forecast_windows()
-split_participants = load_split_participants()
-split_summary = load_split_summary()
-windows_split = load_forecast_windows_with_split()
+stream_summary = load_stream_summary()
+# Single source of truth for participant split assignment across the whole app,
+# the same split forecast anchor computation uses (experiment_c_split_adapt6h_seed42).
+split_participants = load_canonical_stream_split()
 static_features = load_static_features()
 original_participants = load_original_participants()
 original_condition_groups = load_original_condition_groups()
 metadata = multimodal_metadata()
 cohort_selection_meta = load_cohort_selection_metadata()
+t2d_subtype_factors = load_t2d_subtype_clinical_factors()
 participants_table = enrich_participant_table(cohort, split_participants)
 
 st.markdown('''
@@ -879,13 +707,25 @@ st.markdown('''
 ''', unsafe_allow_html=True)
 
 found_count = int(availability["Found/Missing"].astype(str).str.contains("Found", na=False).sum()) if "Found/Missing" in availability.columns else 0
-for col, args in zip(st.columns(3), [
-    ("Participants", cohort["participant_id"].nunique() if "participant_id" in cohort.columns else None, "Enriched cohort"),
-    ("Enriched rows", metadata.get("rows"), "Parquet metadata"),
-    ("Forecast windows", len(forecast_windows) if not forecast_windows.empty else None, "Model-ready windows"),
-]):
-    with col:
-        metric_card(*args)
+summary_cols = st.columns(3)
+with summary_cols[0]:
+    metric_card(
+        "Participants",
+        cohort["participant_id"].nunique() if "participant_id" in cohort.columns else None,
+        "Enriched cohort",
+    )
+with summary_cols[1]:
+    metric_card("Enriched rows", metadata.get("rows"), "Parquet metadata")
+with summary_cols[2]:
+    stream_cols = st.columns(2)
+    with stream_cols[0]:
+        metric_card("Streams", stream_summary.get("streams"), "Participant + segment")
+    with stream_cols[1]:
+        metric_card(
+            "Forecast anchors",
+            stream_summary.get("forecast_anchors"),
+            "15-min stride · all splits",
+        )
 
 st.markdown('''
 <div class="toc">
@@ -893,8 +733,7 @@ st.markdown('''
   <a href="#cohort-participant-explorer">Participant explorer</a>  
   <a href="#preprocessing-pipeline">Preprocessing pipeline</a>
   <a href="#split-validation">Split validation</a>
-  <a href="#phase-timeline">Context / adaptation / evaluation</a>
-  <a href="#forecast-window-visualizer">Forecast windows</a>
+  <a href="#phase-timeline">Streaming participant timeline</a>
   <a href="#time-series">Participant time series</a>
   <a href="#static-profile">Static feature profile</a>
   <a href="#data-quality">Data quality</a>
@@ -921,11 +760,13 @@ else:
         "med_thiazolidinedione": "TZD",
     }
 
-    tab_dist, tab_prop, tab_duration, tab_meds, tab_demo, tab_cgm, tab_cardio = st.tabs([
-        "Clinical distributions", "Cohort proportions",
-        "Duration and windows", "Medication patterns",
+    static_pop_ratio = add_tg_hdl_ratio(static_pop)
+
+    tab_prop, tab_dist, tab_duration, tab_meds, tab_demo, tab_cgm, tab_cardio, tab_t2d = st.tabs([
+        "Cohort proportions", "Clinical distributions",
+        "Duration and coverage", "Medication patterns",
         "Demographic balance", "CGM-derived metrics",
-        "Blood pressure & cardiometabolic",
+        "Blood pressure & cardiometabolic", "T2D heterogeneity",
     ])
     with tab_dist:
         c1, c2 = st.columns(2)
@@ -942,6 +783,59 @@ else:
                     key="pop_hba1c_kde",
                 )
                 st.caption("HbA1c is shown as density curves instead of overlapping histograms so the group-level patterns remain readable.")
+        if static_pop_ratio.empty:
+            st.info("Static features file not available, clinical factor panels require participant_static_features.")
+        else:
+            st.markdown("<div style='height:.5rem'></div>", unsafe_allow_html=True)
+            st.caption("C-peptide, TG/HDL ratio, and waist-to-hip ratio are the same clinical factors used for the frozen T2D subtype clustering in the interpretability chapter.")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                if "c_peptide_ngml_baseline" in static_pop_ratio.columns:
+                    st.plotly_chart(
+                        plot_population_violin(
+                            static_pop_ratio, "c_peptide_ngml_baseline", "study_group",
+                            "C-peptide distribution by study group",
+                        ),
+                        width="stretch", key="pop_cpeptide_violin",
+                    )
+            with c2:
+                if "tg_hdl_ratio" in static_pop_ratio.columns:
+                    st.plotly_chart(
+                        plot_population_violin(
+                            static_pop_ratio, "tg_hdl_ratio", "study_group",
+                            "TG/HDL ratio distribution by study group",
+                        ),
+                        width="stretch", key="pop_tghdl_violin",
+                    )
+            with c3:
+                if "waist_to_hip_ratio_baseline" in static_pop_ratio.columns:
+                    st.plotly_chart(
+                        plot_population_violin(
+                            static_pop_ratio, "waist_to_hip_ratio_baseline", "study_group",
+                            "Waist-to-hip ratio distribution by study group",
+                        ),
+                        width="stretch", key="pop_waisthip_violin",
+                    )
+            st.markdown("<div style='height:.5rem'></div>", unsafe_allow_html=True)
+            c1, c2 = st.columns(2)
+            with c1:
+                if "clinical_systolic_bp_mmhg_baseline" in static_pop_ratio.columns:
+                    st.plotly_chart(
+                        plot_population_violin(
+                            static_pop_ratio, "clinical_systolic_bp_mmhg_baseline", "study_group",
+                            "Systolic BP by study group",
+                        ),
+                        width="stretch", key="pop_dist_sbp_violin",
+                    )
+            with c2:
+                if "clinical_diastolic_bp_mmhg_baseline" in static_pop_ratio.columns:
+                    st.plotly_chart(
+                        plot_population_violin(
+                            static_pop_ratio, "clinical_diastolic_bp_mmhg_baseline", "study_group",
+                            "Diastolic BP by study group",
+                        ),
+                        width="stretch", key="pop_dist_dbp_violin",
+                    )
     with tab_prop:
         c1, c2 = st.columns(2)
         with c1:
@@ -956,16 +850,12 @@ else:
             duration_col_name = "duration_h" if "duration_h" in cohort.columns else "duration_h_trimmed" if "duration_h_trimmed" in cohort.columns else None
             if duration_col_name:
                 st.plotly_chart(plot_kde_curves(cohort, duration_col_name, group_col, "Participant duration KDE"), width="stretch", key="pop_duration_kde")
-            if "n_valid_windows" in cohort.columns:
-                st.plotly_chart(plot_population_violin(cohort, "n_valid_windows", group_col, "Valid windows by study group"), width="stretch", key="pop_windows_violin")
         with c2:
             if duration_col_name:
                 st.plotly_chart(plot_stacked_histogram(cohort, duration_col_name, group_col, "Participant duration stacked histogram"), width="stretch", key="pop_duration_hist")
-            if "n_valid_windows" in cohort.columns:
-                st.plotly_chart(plot_kde_curves(cohort, "n_valid_windows", group_col, "Valid-window KDE curves"), width="stretch", key="pop_windows_kde")
     with tab_meds:
         if static_pop.empty or not static_group_col:
-            st.info("Static features file not available — medication plots require participant_static_features.")
+            st.info("Static features file not available, medication plots require participant_static_features.")
         else:
             present_med_cols = {col: label for col, label in med_cols.items() if col in static_pop.columns}
             if not present_med_cols:
@@ -1013,7 +903,7 @@ else:
 
     with tab_demo:
         if static_pop.empty or not static_group_col:
-            st.info("Static features file not available — demographic balance plots require participant_static_features.")
+            st.info("Static features file not available, demographic balance plots require participant_static_features.")
         else:
             demo_pop = add_ethnicity_label(static_pop)
             demo_pop = attach_original_condition_sources(demo_pop, original_participants, original_condition_groups)
@@ -1100,7 +990,7 @@ else:
 
     with tab_cardio:
         if static_pop.empty:
-            st.info("Static features file not available — cardiometabolic plots require participant_static_features.")
+            st.info("Static features file not available, cardiometabolic plots require participant_static_features.")
         else:
             # ── Row 1: Blood pressure distributions ───────────────────────────
             c1, c2 = st.columns(2)
@@ -1160,6 +1050,41 @@ else:
                     ),
                     width="stretch", key="pop_cardio_corr",
                 )
+
+    with tab_t2d:
+        if t2d_subtype_factors.empty:
+            st.info("Frozen T2D subtype clustering data could not be loaded.")
+        else:
+            cluster_counts = t2d_subtype_factors.drop_duplicates("participant_id").groupby("cluster")["participant_id"].nunique()
+            st.caption(
+                "T2D oral non-insulin participants only, split into the 3 frozen subtype clusters from the "
+                "interpretability chapter (Ward-selected k=3, silhouette and bootstrap ARI validated)."
+            )
+            info_cards([
+                (f"{cluster} (n={cluster_counts.get(cluster, '-')})", T2D_SUBTYPE_CLUSTER_INTERPRETATION[cluster])
+                for cluster in T2D_SUBTYPE_CLUSTER_ORDER
+            ])
+            st.markdown("<div style='height:.5rem'></div>", unsafe_allow_html=True)
+            factor_items = list(T2D_SUBTYPE_FACTOR_COLUMNS.items())
+            for row_start in range(0, len(factor_items), 3):
+                cols = st.columns(3)
+                for col, (factor_key, factor_label) in zip(cols, factor_items[row_start:row_start + 3]):
+                    with col:
+                        sub = t2d_subtype_factors.loc[
+                            t2d_subtype_factors["factor"] == factor_key, ["cluster", "value"]
+                        ].rename(columns={"value": factor_key})
+                        st.plotly_chart(
+                            plot_cluster_box_strip(
+                                sub, factor_key, "cluster",
+                                T2D_SUBTYPE_CLUSTER_ORDER, T2D_SUBTYPE_CLUSTER_COLORS,
+                                f"{factor_label} by subtype cluster",
+                            ),
+                            width="stretch", key=f"t2d_subtype_{factor_key}",
+                        )
+            st.caption(
+                "Clusters were frozen before post hoc interpretation. Fasting status is unconfirmed for "
+                "C-peptide and triglycerides, so TG/HDL and C-peptide profiles carry the same non-fasting caveat as the source analysis."
+            )
 end_section()
 
 
@@ -1179,8 +1104,7 @@ else:
         display_cols = [c for c in [
             "Participant ID", "Split", "Study group", "Clinical site",
             "Age [years]", "BMI [kg/m2]", "HbA1c [%]",
-            "Valid forecast windows", "Clean segments",
-            "Clean duration [h]", "Personalization eligible"
+            "Clean segments", "Clean duration [h]", "Personalization eligible"
         ] if c in participants_table.columns]
 
         st.dataframe(
@@ -1238,6 +1162,7 @@ else:
             r = prow.iloc[0]
             selected_split_label = r.get("Split", "All")
 
+            streamed_duration = r.get("Clean duration [h]")
             info_cards([
                 ("Split", selected_split_label),
                 ("Study group", r.get("Study group")),
@@ -1245,7 +1170,7 @@ else:
                 ("Age", r.get("Age [years]")),
                 ("BMI", r.get("BMI [kg/m2]")),
                 ("HbA1c", r.get("HbA1c [%]")),
-                ("Valid forecast windows", r.get("Valid forecast windows")),
+                ("Streamed duration", f"{streamed_duration:.1f} h" if pd.notna(streamed_duration) else "-"),
             ])
 
 end_section()
@@ -1255,7 +1180,7 @@ end_section()
 section(
     "preprocessing-pipeline",
     "Preprocessing Steps and Cohort Selection Impact",
-    "Stage-level view of how raw multimodal data becomes clean segments, forecast windows, participant splits, and personalization windows."
+    "Stage-level view of how raw multimodal data becomes clean, continuous streams ready for the stateful SSM-CGM model."
 )
 pipeline_df = build_pipeline_summary()
 if cohort_selection_meta:
@@ -1264,7 +1189,7 @@ if cohort_selection_meta:
     st.caption(
         f"Loaded real cohort-selection metadata from cohort_selection.py outputs: "
         f"raw {fmt(counts.get('raw'))} participants -> retained {fmt(counts.get('after_segmentation'))} participants, "
-        f"{fmt(counts.get('total_segments'))} segments, {fmt(counts.get('total_forecast_windows'))} forecast windows."
+        f"{fmt(counts.get('total_segments'))} segments across continuous streams."
     )
 else:
     st.warning("cohort_selection_metadata.json was not found, so this section falls back to available CSV counts.")
@@ -1278,116 +1203,136 @@ pipeline_stage_visual(pipeline_df, selected_stage)
 
 end_section()
 
-section("split-validation", "Train / Validation / Test Split", "Participant repartition, stratification, forecast-window counts, and leakage checks for Experiment C.")
+section(
+    "split-validation",
+    "Train / Validation / Test Split",
+    "Participant repartition and stratification for the single split manifest used everywhere in this dashboard.",
+)
 if split_participants.empty:
-    st.warning("split_participants.csv was not found or could not be loaded.")
+    st.warning(
+        "Placeholder: the canonical split_participants.csv for the epoch-5 streaming checkpoint "
+        "(experiment_c_split_adapt6h_seed42) could not be loaded, so no participant counts are shown here."
+    )
 else:
+    st.caption(
+        f"Sourced from experiment_c_split_adapt6h_seed42/split_participants.csv, the split named in the "
+        f"checkpoint's config_resolved.yaml (split.existing_split_path), matching the epoch-5 checkpoint "
+        f"with val pinball loss {CANONICAL_STREAM_CHECKPOINT_VAL_PINBALL_MGDL:.6f} mg/dL. "
+        f"This is the same manifest used for the participant filter, split labels, and forecast anchors below."
+    )
     c1, c2 = st.columns([1, 1], vertical_alignment="top")
     with c1:
         st.plotly_chart(plot_split_distribution(split_participants, "Participant repartition"), width="stretch", key="split_distribution_main")
     with c2:
-        group_col = "stratum" if "stratum" in split_participants.columns else "study_group" if "study_group" in split_participants.columns else None
-        if group_col:
-            st.plotly_chart(plot_stacked(split_participants, "split", group_col, "Split by study group"), width="stretch", key="split_group_stack")
-    if {"participant_id", "split"}.issubset(split_participants.columns):
-        tmp = split_participants[["participant_id", "split"]].dropna().copy()
-        tmp["Split"] = tmp["split"].map(pretty_split)
-        sets = {name: set(tmp.loc[tmp["Split"] == name, "participant_id"].astype(str)) for name in ["Train", "Validation", "Test"]}
+        split_group_col = "stratum" if "stratum" in split_participants.columns else "study_group" if "study_group" in split_participants.columns else None
+        if split_group_col:
+            st.plotly_chart(plot_stacked(split_participants, "split", split_group_col, "Split by study group"), width="stretch", key="split_group_stack")
+end_section()
 
-    end_section()
-
-section("phase-timeline", "Context / Adaptation / Evaluation Timeline", "Participant-specific visualization of which hours are used as context, adaptation, and evaluation. Use the selector to compare adaptation-window choices.")
-phase_df = pd.DataFrame()
-adaptation_hours = st.radio("Adaptation window", [0, 6, 12, 24, 48], index=4, horizontal=True, format_func=lambda h: f"{h} h")
+section(
+    "phase-timeline",
+    "Streaming participant timeline",
+    "Continuous CGM stream with real segment resets and a one-time warm-up period at the start of the stream.",
+)
+warmup_hours = st.radio(
+    "Warm-up length",
+    PERSONALIZATION_WARMUP_HOURS,
+    index=len(PERSONALIZATION_WARMUP_HOURS) - 1,
+    horizontal=True,
+    format_func=lambda hours: f"{hours} h",
+)
 if selected_participant:
-    phase_df, phase_note = build_phase_table(selected_participant, selected_split_label, adaptation_hours)
-    if phase_note:
-        st.caption(phase_note)
-
-    if selected_split_label == "Train":
-        st.info(
-            "This participant belongs to the training split. "
-            "Context/adaptation/evaluation phases are only defined for validation/test personalization. "
-            "The full time series is still shown below."
-        )
-    elif not phase_df.empty:
-        st.plotly_chart(
-            plot_participant_timeline(phase_df, selected_participant, adaptation_hours),
-            width="stretch",
-            key=f"phase_timeline_{selected_participant}_{adaptation_hours}",
-        )
-        summary = phase_summary(phase_df)
-        if not summary.empty:
-            info_cards([(f"{row['Phase']} duration", f"{row['Duration [h]']:.1f} h") for _, row in summary.iterrows()])
-            st.dataframe(summary, width="stretch", hide_index=True)
+    timeline_df = load_participant_timeseries(selected_participant)
+    timeline_time_col = detect_timestamp_column(timeline_df)
+    if timeline_df.empty:
+        st.warning("No time-series rows could be loaded for this participant.")
+    elif not timeline_time_col:
+        st.warning("No timestamp column is available for the streaming timeline.")
     else:
-        st.warning("No context/adaptation/evaluation timing found for the selected validation/test participant.")
+        try:
+            participant_segments = segment_boundaries(
+                timeline_df,
+                "participant_id",
+                timeline_time_col,
+            )
+        except ValueError as exc:
+            participant_segments = pd.DataFrame()
+            st.warning(f"Segment reset markers are unavailable: {exc}")
+
+        forecast_anchors = load_forecast_anchors()
+        participant_anchors = forecast_anchors[
+            forecast_anchors["participant_id"].astype(str).eq(str(selected_participant))
+        ].copy() if not forecast_anchors.empty else pd.DataFrame()
+
+        st.caption(
+            "The continuous signal carries model state forward between real segment resets. "
+            "Warm-up applies once, at the very start of the participant's stream; a later segment reset "
+            "does not restart it. The shaded band marks the warm-up period and the solid line marks where "
+            "scored evaluation begins."
+        )
+        if participant_anchors.empty:
+            # split_participants is the single source of truth used everywhere in this app
+            # (Participant Explorer filter, split labels, this timeline, and forecast anchors),
+            # so canonical_split_label and selected_split_label should always agree for any
+            # participant present in the split manifest. The mismatch note below is a safeguard
+            # for a still-misconfigured state (for example, a participant missing from the
+            # split manifest entirely), not expected behavior for ordinary participants.
+            canonical_row = split_participants[
+                split_participants["participant_id"].astype(str) == str(selected_participant)
+            ] if not split_participants.empty else pd.DataFrame()
+            canonical_split_label = pretty_split(canonical_row.iloc[0]["split"]) if not canonical_row.empty else None
+
+            if canonical_split_label == "Train":
+                empty_anchor_message = "Train participants are not personalized, so no forecast anchors exist."
+                if str(selected_split_label).strip().lower() != "train":
+                    empty_anchor_message += (
+                        f" Note: this participant is Train in the canonical model split "
+                        f"(experiment_c_split_adapt6h_seed42) that the checkpoint and forecast anchors actually "
+                        f"use, even though the filter above shows {selected_split_label}. This indicates a "
+                        f"split-source misconfiguration, since both should read from the same manifest."
+                    )
+            else:
+                total_stream_hours = (
+                    (participant_segments["end"] - participant_segments["start"]).dt.total_seconds().sum() / 3600
+                    if not participant_segments.empty else 0.0
+                )
+                if total_stream_hours <= float(warmup_hours):
+                    shorter_options = [h for h in PERSONALIZATION_WARMUP_HOURS if h < total_stream_hours]
+                    suggestion = (
+                        f" Try a shorter warm-up length, such as {max(shorter_options)} h, to see scored anchors."
+                        if shorter_options else ""
+                    )
+                    empty_anchor_message = (
+                        f"This participant's stream is only {total_stream_hours:.1f} h long, shorter than the "
+                        f"{float(warmup_hours):g} h warm-up window selected, so no scored anchors exist.{suggestion}"
+                    )
+                else:
+                    empty_anchor_message = (
+                        "No forecast anchors were found for this validation/test participant in the model's "
+                        "prediction output."
+                    )
+            st.info(empty_anchor_message)
+
+        st.plotly_chart(
+            plot_participant_timeseries(
+                timeline_df,
+                timeline_time_col,
+                [STREAM_TIMELINE_SIGNAL],
+                segment_boundaries_df=participant_segments,
+                anchor_df=participant_anchors,
+                warmup_hours=warmup_hours,
+                segment_gap_minutes=CGM_SEGMENT_GAP_MINUTES,
+                title=f"Participant {selected_participant} continuous stream",
+            ),
+            width="stretch",
+            key=f"stream_timeline_{selected_participant}_{warmup_hours}",
+        )
 else:
     st.info("Select a participant in the cohort explorer first.")
 end_section()
 
 
-section(
-    "forecast-window-visualizer",
-    "Forecast-Window Visualizer",
-    "Inspect the sliding SSM-CGM forecast windows for the selected participant: encoder input context, decoder target horizon, prediction timestamp, stride, and overlap."
-)
-with st.expander('How SSM-CGM forecasting windows are constructed: "How forecast windows are generated"', expanded=False):
-    if selected_participant:
-        participant_windows = participant_forecast_windows(selected_participant, selected_split_label)
-        if participant_windows.empty:
-            st.warning("No forecast windows found for this participant in forecast_windows.csv or forecast_windows_with_split.csv.")
-        else:
-            c1, c2, c3 = st.columns([1.2, 1.0, 2.6])
-            segment_values = ["All"]
-            if "segment_id" in participant_windows.columns:
-                segment_values += [str(v) for v in sorted(participant_windows["segment_id"].dropna().unique().tolist())]
-            with c1:
-                selected_segment = st.selectbox("Segment", segment_values, index=0)
-            shown_windows = participant_windows.copy()
-            if selected_segment != "All" and "segment_id" in shown_windows.columns:
-                shown_windows = shown_windows[shown_windows["segment_id"].astype(str) == selected_segment].reset_index(drop=True)
-            with c2:
-                target_hours = st.selectbox("Target horizon", [0.5, 1.0, 2.0], index=1, format_func=lambda x: f"{x:g} h")
-            with c3:
-                window_position = st.slider(
-                    "Window index",
-                    min_value=0,
-                    max_value=max(0, len(shown_windows) - 1),
-                    value=0,
-                    step=1,
-                    disabled=shown_windows.empty,
-                )
-            bin_minutes = 5.0
-            if not shown_windows.empty:
-                fw_ts_df = load_participant_timeseries(selected_participant)
-                fw_time_col = detect_timestamp_column(fw_ts_df)
-                info_cards(forecast_window_summary(shown_windows, window_position, bin_minutes, target_hours))
-                st.info(
-                    "One training sample = multimodal history from the encoder context "
-                    "followed by prediction of the next CGM target horizon. "
-                    "The red shaded region is the target trajectory the model learns to forecast."
-                )
-                st.plotly_chart(
-                    plot_forecast_window(
-                        shown_windows,
-                        window_position,
-                        bin_minutes=bin_minutes,
-                        target_hours=target_hours,
-                        ts_df=fw_ts_df,
-                        time_col=fw_time_col,
-                    ),
-                    width="stretch",
-                    key=f"forecast_window_{selected_participant}_{selected_segment}_{window_position}_{target_hours}",
-                )
-                with st.expander("Selected forecast-window row"):
-                    st.dataframe(humanize_columns(shown_windows.iloc[[window_position]]), width="stretch", hide_index=True)
-                st.caption("Window bounds are stored as 5-minute bins. Previous/current/next windows show overlap; signal curves show the selected sample's actual CGM, HR, RR, and activity values.")
-    else:
-        st.info("Select a participant in the cohort explorer first.")
-end_section()
-
-section("time-series", "Participant Time-Series Explorer", "Large stacked plots for CGM glucose, heart rate, respiratory rate, and activity, with context/adaptation/evaluation regions overlaid.")
+section("time-series", "Participant Time-Series Explorer", "Large stacked plots for CGM glucose, heart rate, respiratory rate, and activity.")
 ts_df = pd.DataFrame()
 time_col = None
 if selected_participant:
@@ -1412,16 +1357,10 @@ if selected_participant:
             ("Mean heart rate", f"{stats.get('mean_hr', np.nan):.1f} bpm" if pd.notna(stats.get("mean_hr")) else "-"),
             ("Mean respiratory rate", f"{stats.get('mean_rr', np.nan):.1f} breaths/min" if pd.notna(stats.get("mean_rr")) else "-"),
         ])
-        if selected_split_label == "Train":
-            st.caption(
-                "Training participant: showing the available multimodal time series. "
-                "No adaptation/evaluation overlay is expected for train participants."
-            )
-        phase_overlay = phase_df if selected_split_label != "Train" else pd.DataFrame()
         st.plotly_chart(
-            plot_participant_timeseries(ts_df, time_col, chosen, phase_overlay),
+            plot_participant_timeseries(ts_df, time_col, chosen),
             width="stretch",
-            key=f"timeseries_{selected_participant}_{adaptation_hours}_{'-'.join(chosen)}",
+            key=f"timeseries_{selected_participant}_{'-'.join(chosen)}",
         )
 else:
     st.info("Select a participant in the cohort explorer first.")
@@ -1536,7 +1475,10 @@ if selected_participant:
                 st.info("No cohort metadata row found.")
         with tabs[4]:
             meas = load_measurements_long(selected_participant)
-            st.dataframe(humanize_columns(meas.head(1000)), width="stretch", hide_index=True) if not meas.empty else st.info("No measurement rows found or file missing.")
+            if not meas.empty:
+                st.dataframe(humanize_columns(meas.head(1000)), width="stretch", hide_index=True)
+            else:
+                st.info("No measurement rows found or file missing.")
 else:
     st.info("Select a participant in the cohort explorer first.")
 end_section()
@@ -1551,11 +1493,4 @@ with q2:
         st.plotly_chart(plot_histogram(segments, dcol, "Clean segment duration"), width="stretch", key="quality_segment_duration")
     else:
         st.info("No segment duration column found.")
-if selected_participant and not windows_split.empty and "participant_id" in windows_split.columns:
-    pw = windows_split[windows_split["participant_id"].astype(str) == str(selected_participant)]
-    metric_card("Selected participant split windows", len(pw), "Rows in forecast_windows_with_split.csv")
-    with st.expander("Selected participant split-window rows"):
-        st.dataframe(humanize_columns(pw.head(1000)), width="stretch", hide_index=True)
 end_section()
-
-st.markdown('<p class="small-note">Visual and conceptual references used only as inspiration: T1DEXIpreprocess for preprocessing-dashboard motivation and Biodelphis for one-page scientific hierarchy. No project data or training scripts were moved or modified.</p>', unsafe_allow_html=True)

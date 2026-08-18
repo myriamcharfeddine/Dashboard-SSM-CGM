@@ -5,6 +5,27 @@ BASE_DATA_DIR = Path("/home/myriamcharfeddine/CGM/Data/")
 ENRICHED_DATASET_DIR = Path("/home/myriamcharfeddine/CGM/Data/enriched_multimodal/")
 EXPERIMENT_C_SPLIT_DIR = Path("/home/myriamcharfeddine/CGM/Data/experiment_c_split_adapt48h_seed42/")
 RESULTS_DIR = Path("/home/myriamcharfeddine/CGM/Data/results/")
+SSM_STREAM_OUTPUT_DIR = Path(
+    "/home/myriamcharfeddine/CGM/SSM-CGM/outputs/aireadi_stream_mamba_stateful_5epoch"
+)
+SSM_STREAM_VALIDATION_OUTPUT_DIR = Path(
+    "/home/myriamcharfeddine/CGM/SSM-CGM/outputs/aireadi_stream_mamba_stateful_10epoch_eval_validation"
+)
+SSM_STREAM_TEST_OUTPUT_DIR = Path(
+    "/home/myriamcharfeddine/CGM/SSM-CGM/outputs/aireadi_stream_mamba_stateful_10epoch_eval_test"
+)
+# Canonical participant split used to train the epoch-5 checkpoint at
+# SSM_STREAM_OUTPUT_DIR (see config_resolved.yaml: split.existing_split_path),
+# distinct from EXPERIMENT_C_SPLIT_DIR, which backs the retired windowed pipeline.
+CANONICAL_STREAM_SPLIT_DIR = Path("/home/myriamcharfeddine/CGM/Data/experiment_c_split_adapt6h_seed42/")
+CANONICAL_STREAM_CHECKPOINT_VAL_PINBALL_MGDL = 3.286316
+# Frozen T2D oral non-insulin subtype clustering (C1/C2/C3) used in the
+# interpretability chapter; per-participant clinical factor values, long format.
+T2D_SUBTYPE_CLINICAL_FACTORS_PATH = Path(
+    "/home/myriamcharfeddine/CGM/SSM-CGM/outputs/static_phenotype_trajectory_stratified_v2/"
+    "extended_clinical_latent_dynamics_v1/01_cluster_metabolic_profiles/figure_1A_plotted_data.csv"
+)
+T2D_SUBTYPE_STRATUM = "t2d_oral_non_insulin"
 
 EXPECTED_FILES = {
     "final_multimodal_dataset*.parquet": ENRICHED_DATASET_DIR / "final_multimodal_dataset*.parquet",
@@ -14,7 +35,7 @@ EXPECTED_FILES = {
     "forecast_windows.csv": ENRICHED_DATASET_DIR / "forecast_windows.csv",
     "participant_measurements_selected_long.parquet": ENRICHED_DATASET_DIR / "participant_measurements_selected_long.parquet",
     "participant_medications_long.parquet": ENRICHED_DATASET_DIR / "participant_medications_long.parquet",
-    "split_participants.csv": EXPERIMENT_C_SPLIT_DIR / "split_participants.csv",
+    "split_participants.csv": CANONICAL_STREAM_SPLIT_DIR / "split_participants.csv",
     "forecast_windows_with_split.csv": EXPERIMENT_C_SPLIT_DIR / "forecast_windows_with_split.csv",
     "val_personalization_windows.csv": EXPERIMENT_C_SPLIT_DIR / "val_personalization_windows.csv",
     "test_personalization_windows.csv": EXPERIMENT_C_SPLIT_DIR / "test_personalization_windows.csv",
@@ -22,11 +43,31 @@ EXPECTED_FILES = {
 
 PARTICIPANT_COL = "participant_id"
 PALETTE = ["#BA2828", "#003366", "#5BBABA", "#FF0000", "#888888"]
-PHASE_COLORS = {
-    "Context": "#003366",
-    "Adaptation": "#5BBABA",
-    "Evaluation": "#BA2828",
-    "Unused / other": "#888888",
+STRATUM_COLORS = {
+    "Forecast anchor": PALETTE[0],
+    "Warm-up": PALETTE[4],
+    "Segment reset": PALETTE[4],
+}
+PERSONALIZATION_WARMUP_HOURS = (0, 6, 12, 24, 48)
+STREAM_TIMELINE_SIGNAL = "cgm_glucose_mean"
+T2D_SUBTYPE_CLUSTER_ORDER = ["C1", "C2", "C3"]
+T2D_SUBTYPE_CLUSTER_COLORS = {
+    "C1": PALETTE[1],
+    "C2": PALETTE[2],
+    "C3": PALETTE[0],
+}
+T2D_SUBTYPE_CLUSTER_INTERPRETATION = {
+    "C1": "Lower BMI and lower proxy profile, more MARD-like",
+    "C2": "Obesity dominant and younger profile, MOD-like",
+    "C3": "Higher C-peptide, TG/HDL, and central adiposity, SIRD-like",
+}
+T2D_SUBTYPE_FACTOR_COLUMNS = {
+    "participants_age": "Age [years]",
+    "bmi_baseline": "BMI [kg/m2]",
+    "hba1c_percent_baseline": "HbA1c [%]",
+    "c_peptide_ngml_baseline": "C-peptide [ng/mL]",
+    "tg_hdl_ratio": "TG/HDL ratio",
+    "waist_to_hip_ratio_baseline": "Waist-to-hip ratio",
 }
 SPLIT_COLORS = {
     "Train": "#003366",
@@ -101,6 +142,10 @@ COLUMN_LABELS = {
     "tir_70_180_pct": "Time in range 70-180 [%]",
     "cv_pct": "Glucose CV [%]",
     "cgm_rows": "CGM rows",
+    "c_peptide_ngml_baseline": "C-peptide [ng/mL]",
+    "tg_hdl_ratio": "TG/HDL ratio",
+    "waist_to_hip_ratio_baseline": "Waist-to-hip ratio",
+    "participants_age": "Age [years]",
 }
 STUDY_GROUP_LABELS = {
     "healthy": "Healthy",

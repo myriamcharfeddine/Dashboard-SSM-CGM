@@ -1,22 +1,52 @@
 """Cached defensive loaders for enriched CGM data and Experiment C split artifacts."""
 from __future__ import annotations
 
-from pathlib import Path
 import json
+import sys
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
 from config import (
     BASE_DATA_DIR,
+    CANONICAL_STREAM_SPLIT_DIR,
     CORE_TS_COLS,
     ENRICHED_DATASET_DIR,
-    EXPERIMENT_C_SPLIT_DIR,
     EXPECTED_FILES,
     PARTICIPANT_COL,
     RESULTS_DIR,
+    SSM_STREAM_OUTPUT_DIR,
+    SSM_STREAM_TEST_OUTPUT_DIR,
+    SSM_STREAM_VALIDATION_OUTPUT_DIR,
+    T2D_SUBTYPE_CLINICAL_FACTORS_PATH,
+    T2D_SUBTYPE_STRATUM,
     TIMESTAMP_CANDIDATES,
 )
+
+SSM_CGM_REPO_DIR = SSM_STREAM_OUTPUT_DIR.parents[1]
+SSM_CGM_REPO_DIR_TEXT = str(SSM_CGM_REPO_DIR)
+if SSM_CGM_REPO_DIR_TEXT not in sys.path:
+    sys.path.insert(0, SSM_CGM_REPO_DIR_TEXT)
+
+from Preprocessing.cohort_selection import (  # noqa: E402
+    CORE_COLS as SEGMENTATION_CORE_COLS,
+    GAP_THRESHOLDS_MIN,
+    _segment_participant,
+)
+
+CGM_SEGMENT_GAP_MINUTES = GAP_THRESHOLDS_MIN["cgm"]
+FORECAST_ANCHOR_HORIZON_STEP = 1
+FORECAST_ANCHOR_SCENARIO_MODE = "forecast_only"
+FORECAST_PREDICTIONS_RELATIVE_PATH = Path("predictions") / "predictions.parquet"
+FORECAST_ANCHOR_COLUMNS = [
+    PARTICIPANT_COL, "segment_id", "split", "anchor_time_idx",
+    "anchor_timestamp", "hours_since_start", "scenario_mode", "horizon_step",
+]
+FORECAST_ANCHOR_KEY_COLUMNS = [
+    PARTICIPANT_COL, "segment_id", "split", "anchor_time_idx",
+]
+SEGMENT_BOUNDARY_COLUMNS = ["segment_id", "start", "end"]
 
 
 def _size(path: Path) -> str:
@@ -172,32 +202,163 @@ def load_segments() -> pd.DataFrame:
     return _csv(ENRICHED_DATASET_DIR / "segments.csv")
 
 
-@st.cache_data(show_spinner=False)
-def load_forecast_windows() -> pd.DataFrame:
-    return _csv(ENRICHED_DATASET_DIR / "forecast_windows.csv")
+def segment_boundaries(
+    df: pd.DataFrame,
+    participant_col: str,
+    timestamp_col: str,
+) -> pd.DataFrame:
+    """Return real start and end timestamps for one participant's clean segments."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=SEGMENT_BOUNDARY_COLUMNS)
+
+    required = {participant_col, timestamp_col, *SEGMENTATION_CORE_COLS.values()}
+    missing = sorted(required.difference(df.columns))
+    if missing:
+        raise ValueError(f"Segment boundary input is missing columns: {', '.join(missing)}")
+
+    work = df.loc[:, sorted(required)].dropna(subset=[participant_col]).copy()
+    work[participant_col] = work[participant_col].astype(str)
+    participant_ids = work[participant_col].unique()
+    if len(participant_ids) != 1:
+        raise ValueError(
+            "segment_boundaries expects exactly one participant; "
+            f"received {len(participant_ids)}"
+        )
+
+    work[timestamp_col] = pd.to_datetime(work[timestamp_col], errors="coerce")
+    work = work.dropna(subset=[timestamp_col]).set_index(timestamp_col).sort_index()
+    if work.empty:
+        return pd.DataFrame(columns=SEGMENT_BOUNDARY_COLUMNS)
+
+    rows = [
+        {"segment_id": segment_id, "start": segment.index.min(), "end": segment.index.max()}
+        for segment_id, segment in enumerate(_segment_participant(work))
+    ]
+    return pd.DataFrame(rows, columns=SEGMENT_BOUNDARY_COLUMNS)
 
 
 @st.cache_data(show_spinner=False)
-def load_split_participants() -> pd.DataFrame:
-    return _csv(EXPERIMENT_C_SPLIT_DIR / "split_participants.csv")
+def load_forecast_anchors() -> pd.DataFrame:
+    """Load one timestamped marker per canonical validation or test forecast anchor."""
+    paths = [
+        output_dir / FORECAST_PREDICTIONS_RELATIVE_PATH
+        for output_dir in (SSM_STREAM_VALIDATION_OUTPUT_DIR, SSM_STREAM_TEST_OUTPUT_DIR)
+    ]
+    frames = []
+    filters = [
+        ("horizon_step", "==", FORECAST_ANCHOR_HORIZON_STEP),
+        ("scenario_mode", "==", FORECAST_ANCHOR_SCENARIO_MODE),
+    ]
+    for path in paths:
+        frame = _parquet(path, columns=FORECAST_ANCHOR_COLUMNS, filters=filters)
+        if not frame.empty:
+            frames.append(frame)
+    if not frames:
+        return pd.DataFrame(columns=FORECAST_ANCHOR_COLUMNS)
+
+    anchors = pd.concat(frames, ignore_index=True)
+    anchors[PARTICIPANT_COL] = anchors[PARTICIPANT_COL].astype(str)
+    anchors["anchor_timestamp"] = pd.to_datetime(
+        anchors["anchor_timestamp"], errors="coerce"
+    )
+    invalid_timestamp_count = int(anchors["anchor_timestamp"].isna().sum())
+    if invalid_timestamp_count:
+        _warn(f"Excluded {invalid_timestamp_count:,} forecast anchors with invalid timestamps.")
+    anchors = anchors.dropna(subset=["anchor_timestamp"])
+    anchors = anchors.drop_duplicates(FORECAST_ANCHOR_KEY_COLUMNS, keep="first")
+    return anchors.sort_values(
+        [PARTICIPANT_COL, "segment_id", "anchor_time_idx"]
+    ).reset_index(drop=True)
+
+
+def _stream_anchor_count(path: Path) -> int | None:
+    """Count anchors once per stream, never once per horizon/scenario row."""
+    try:
+        df = pd.read_csv(path)
+    except (FileNotFoundError, OSError, pd.errors.ParserError):
+        return None
+    if df.empty or "n_anchors" not in df.columns:
+        return None
+    if "scenario_mode" in df.columns:
+        forecast_only = df[df["scenario_mode"].eq("forecast_only")]
+        if not forecast_only.empty:
+            df = forecast_only
+    stream_cols = [c for c in ["participant_id", "segment_id"] if c in df.columns]
+    if stream_cols:
+        df = df.drop_duplicates(stream_cols)
+    return int(pd.to_numeric(df["n_anchors"], errors="coerce").fillna(0).sum())
 
 
 @st.cache_data(show_spinner=False)
-def load_split_summary() -> pd.DataFrame:
-    return _csv(EXPERIMENT_C_SPLIT_DIR / "split_summary.csv")
+def load_stream_summary() -> dict:
+    """Load stateful SSM-CGM stream and true forecast-anchor totals."""
+    stream_count = None
+    try:
+        segment_df = pd.read_csv(ENRICHED_DATASET_DIR / "segments.csv")
+        stream_cols = [c for c in ["participant_id", "segment_id"] if c in segment_df.columns]
+        stream_count = int(segment_df.drop_duplicates(stream_cols).shape[0]) if stream_cols else int(len(segment_df))
+    except (FileNotFoundError, OSError, pd.errors.ParserError):
+        pass
+
+    train_anchors = validation_anchors = None
+    training_path = SSM_STREAM_OUTPUT_DIR / "metrics" / "training_summary.json"
+    try:
+        training_summary = json.loads(training_path.read_text())
+        history = training_summary.get("history", [])
+        if history:
+            latest = history[-1]
+            train_anchors = int(latest["n_train_anchors"])
+            validation_anchors = int(latest["n_val_anchors"])
+    except (FileNotFoundError, OSError, ValueError, KeyError, TypeError):
+        pass
+
+    validation_memory = SSM_STREAM_VALIDATION_OUTPUT_DIR / "hardware" / "stream_state_memory.csv"
+    validation_anchors = validation_anchors or _stream_anchor_count(validation_memory)
+    test_memory = SSM_STREAM_TEST_OUTPUT_DIR / "hardware" / "stream_state_memory.csv"
+    test_anchors = _stream_anchor_count(test_memory)
+
+    split_counts = [train_anchors, validation_anchors, test_anchors]
+    total_anchors = sum(split_counts) if all(value is not None for value in split_counts) else None
+    return {
+        "streams": stream_count,
+        "forecast_anchors": total_anchors,
+        "train_anchors": train_anchors,
+        "validation_anchors": validation_anchors,
+        "test_anchors": test_anchors,
+    }
 
 
 @st.cache_data(show_spinner=False)
-def load_forecast_windows_with_split() -> pd.DataFrame:
-    return _csv(EXPERIMENT_C_SPLIT_DIR / "forecast_windows_with_split.csv")
+def load_canonical_stream_split() -> pd.DataFrame:
+    """Load the single source of truth for participant split assignment.
+
+    Sourced from CANONICAL_STREAM_SPLIT_DIR, referenced as
+    split.existing_split_path in the checkpoint's config_resolved.yaml, this
+    is the actual split the canonical streaming checkpoint was trained and
+    evaluated on, and the same split forecast anchor computation uses. Every
+    Train/Validation/Test label shown anywhere in the dashboard must be
+    derived from this loader; EXPERIMENT_C_SPLIT_DIR backs the retired
+    windowed-forecasting pipeline and no longer matches the streaming model.
+    """
+    return _csv(CANONICAL_STREAM_SPLIT_DIR / "split_participants.csv")
 
 
 @st.cache_data(show_spinner=False)
-def load_personalization_windows(split: str) -> pd.DataFrame:
-    if split not in {"val", "test", "validation"}:
+def load_t2d_subtype_clinical_factors() -> pd.DataFrame:
+    """Load per-participant clinical factor values for the frozen T2D oral non-insulin subtypes.
+
+    These are the C1/C2/C3 clusters used in the interpretability chapter,
+    frozen before post hoc interpretation.
+    """
+    df = _csv(T2D_SUBTYPE_CLINICAL_FACTORS_PATH)
+    if df.empty or not {"canonical_stratum", "display_cluster", "participant_id"}.issubset(df.columns):
         return pd.DataFrame()
-    name = "val" if split == "validation" else split
-    return _csv(EXPERIMENT_C_SPLIT_DIR / f"{name}_personalization_windows.csv")
+    df = df[df["canonical_stratum"] == T2D_SUBTYPE_STRATUM].copy()
+    if df.empty:
+        return df
+    df["participant_id"] = df["participant_id"].astype(str)
+    df["cluster"] = "C" + df["display_cluster"].astype(int).astype(str)
+    return df
 
 
 @st.cache_data(show_spinner=False)

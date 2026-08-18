@@ -7,12 +7,27 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from config import COLUMN_LABELS, PALETTE, PHASE_COLORS, SIGNAL_COLUMNS, SPLIT_COLORS, STUDY_GROUP_LABELS
+from config import COLUMN_LABELS, PALETTE, SIGNAL_COLUMNS, SPLIT_COLORS, STRATUM_COLORS, STUDY_GROUP_LABELS
 
 PAPER_BG = "rgba(0,0,0,0)"
 PLOT_BG = "rgba(0,0,0,0)"
 GRID = "rgba(136,136,136,0.18)"
 TEXT = "#003366"
+ANCHOR_ROLE = "Forecast anchor"
+SEGMENT_RESET_ROLE = "Segment reset"
+WARMUP_ROLE = "Warm-up"
+ANCHOR_MARKER_SIZE = 6
+ANCHOR_MARKER_OPACITY = 0.82
+SEGMENT_RESET_LINE_WIDTH = 1.5
+SEGMENT_RESET_LINE_DASH = "dash"
+WARMUP_END_LINE_WIDTH = 1.5
+WARMUP_END_LINE_DASH = "solid"
+WARMUP_BAND_FILLCOLOR = "rgba(136,136,136,0.14)"
+PARTIAL_STREAM_LINE_COLOR = PALETTE[2]
+PARTIAL_STREAM_LINE_DASH = "dot"
+PARTIAL_STREAM_LINE_WIDTH = 1.5
+PARTIAL_STREAM_BAND_FILLCOLOR = "rgba(91,186,186,0.16)"
+PARTIAL_STREAM_LABEL = "CGM available, other modalities incomplete"
 
 MEDICATION_CLASS_COLORS = {
     "Metformin": "#BA2828",
@@ -81,16 +96,6 @@ def pretty_group(value) -> str:
     raw = str(value)
     return STUDY_GROUP_LABELS.get(raw, STUDY_GROUP_LABELS.get(raw.lower(), raw.replace("_", " ").replace("-", " ").title()))
 
-
-def pretty_phase(value) -> str:
-    text = str(value).lower()
-    if "context" in text:
-        return "Context"
-    if "adapt" in text:
-        return "Adaptation"
-    if "eval" in text:
-        return "Evaluation"
-    return "Unused / other"
 
 
 def style_fig(fig, height: int = 380, title: str | None = None):
@@ -213,57 +218,17 @@ def plot_histogram(df: pd.DataFrame, column: str, title: str, nbins: int = 45):
     return style_fig(fig, height=360, title=title)
 
 
-def plot_windows_per_participant(windows_df: pd.DataFrame):
-    if windows_df is None or windows_df.empty or "participant_id" not in windows_df.columns:
-        return empty_plot("No forecast windows table available")
-    tmp = windows_df.groupby("participant_id").size().reset_index(name="windows")
-    return plot_histogram(tmp, "windows", "Forecast windows per participant")
 
-
-def plot_participant_timeline(phase_df: pd.DataFrame, participant_id: str, adaptation_hours: int | float | None = None):
-    if phase_df is None or phase_df.empty:
-        return empty_plot("No context, adaptation, or evaluation periods available", height=410)
-    if not {"phase", "start", "end"}.issubset(phase_df.columns):
-        return empty_plot("Timeline timestamps are unavailable", height=410)
-    df = phase_df.copy()
-    df["Phase"] = df["phase"].map(pretty_phase)
-    df["Start"] = pd.to_datetime(df["start"], errors="coerce")
-    df["End"] = pd.to_datetime(df["end"], errors="coerce")
-    df = df.dropna(subset=["Start", "End"])
-    if df.empty:
-        return empty_plot("Timeline timestamps could not be parsed", height=410)
-    df["Duration [h]"] = (df["End"] - df["Start"]).dt.total_seconds() / 3600
-    fig = px.timeline(
-        df,
-        x_start="Start",
-        x_end="End",
-        y="Phase",
-        color="Phase",
-        color_discrete_map=PHASE_COLORS,
-        category_orders={"Phase": ["Context", "Adaptation", "Evaluation", "Unused / other"]},
-        hover_data={"Duration [h]": ":.1f"},
-    )
-    fig.update_traces(marker_line_color="rgba(0,51,102,.35)", marker_line_width=1)
-    fig.update_yaxes(autorange="reversed", title="Experiment C phase")
-    subtitle = f"Participant {participant_id}"
-    if adaptation_hours is not None:
-        subtitle += f" · adaptation window {adaptation_hours:g} h"
-    fig.update_xaxes(title="Time", tickformat="%b %d\n%H:%M")
-    return style_fig(fig, height=450, title=subtitle)
-
-
-def phase_summary(phase_df: pd.DataFrame) -> pd.DataFrame:
-    if phase_df is None or phase_df.empty or not {"phase", "start", "end"}.issubset(phase_df.columns):
-        return pd.DataFrame()
-    df = phase_df.copy()
-    df["Phase"] = df["phase"].map(pretty_phase)
-    df["Start"] = pd.to_datetime(df["start"], errors="coerce")
-    df["End"] = pd.to_datetime(df["end"], errors="coerce")
-    df["Duration [h]"] = (df["End"] - df["Start"]).dt.total_seconds() / 3600
-    return df[["Phase", "Start", "End", "Duration [h]"]].sort_values("Start")
-
-
-def plot_participant_timeseries(ts_df: pd.DataFrame, time_col: str | None, selected_signals: list[str], phase_df: pd.DataFrame | None = None):
+def plot_participant_timeseries(
+    ts_df: pd.DataFrame,
+    time_col: str | None,
+    selected_signals: list[str],
+    segment_boundaries_df: pd.DataFrame | None = None,
+    anchor_df: pd.DataFrame | None = None,
+    warmup_hours: int | float | None = None,
+    segment_gap_minutes: int | float | None = None,
+    title: str = "Participant signal timeline",
+):
     if ts_df is None or ts_df.empty:
         return empty_plot("No participant time series loaded", height=620)
     if not time_col or time_col not in ts_df.columns:
@@ -291,25 +256,170 @@ def plot_participant_timeseries(ts_df: pd.DataFrame, time_col: str | None, selec
         )
         fig.update_yaxes(title_text=labels.get(col, pretty_col(col)), row=idx, col=1)
 
-    if phase_df is not None and not phase_df.empty and {"phase", "start", "end"}.issubset(phase_df.columns):
-        for _, row in phase_df.iterrows():
-            start = pd.to_datetime(row.get("start"), errors="coerce")
-            end = pd.to_datetime(row.get("end"), errors="coerce")
-            if pd.isna(start) or pd.isna(end):
-                continue
-            phase = pretty_phase(row.get("phase"))
-            fill = {
-                "Context": "rgba(0,51,102,0.10)",
-                "Adaptation": "rgba(91,186,186,0.16)",
-                "Evaluation": "rgba(186,40,40,0.13)",
-            }.get(phase, "rgba(136,136,136,0.10)")
-            for r in range(1, len(available) + 1):
-                fig.add_vrect(x0=start, x1=end, fillcolor=fill, line_width=0, row=r, col=1)
-            fig.add_vrect(x0=start, x1=end, fillcolor=fill, line_width=0, annotation_text=phase, annotation_position="top left", row=1, col=1)
+    all_segment_starts = pd.to_datetime(
+        segment_boundaries_df.get("start", pd.Series(dtype=object)),
+        errors="coerce",
+    ).dropna().sort_values() if segment_boundaries_df is not None and not segment_boundaries_df.empty else pd.Series(dtype="datetime64[ns]")
+    stream_start = all_segment_starts.iloc[0] if not all_segment_starts.empty else None
+    if stream_start is None:
+        ts_times = pd.to_datetime(ts_df[time_col], errors="coerce").dropna()
+        stream_start = ts_times.min() if not ts_times.empty else None
+
+    if not all_segment_starts.empty:
+        reset_times = all_segment_starts.iloc[1:]
+        for reset_time in reset_times:
+            fig.add_shape(
+                type="line",
+                x0=reset_time,
+                x1=reset_time,
+                y0=0,
+                y1=1,
+                xref="x",
+                yref="paper",
+                line=dict(
+                    color=STRATUM_COLORS[SEGMENT_RESET_ROLE],
+                    width=SEGMENT_RESET_LINE_WIDTH,
+                    dash=SEGMENT_RESET_LINE_DASH,
+                ),
+            )
+        if not reset_times.empty:
+            reset_label = "segment reset"
+            if segment_gap_minutes is not None:
+                reset_label = f"segment reset, gap > {segment_gap_minutes:g} min"
+            fig.add_annotation(
+                x=reset_times.iloc[0],
+                y=1,
+                xref="x",
+                yref="paper",
+                text=reset_label,
+                showarrow=False,
+                xanchor="left",
+                yanchor="bottom",
+                font=dict(color=STRATUM_COLORS[SEGMENT_RESET_ROLE], size=11),
+            )
+
+    raw_signal_start = pd.to_datetime(
+        ts_df.loc[ts_df[available[0]].notna(), time_col], errors="coerce"
+    ).min() if available else None
+
+    if (
+        stream_start is not None
+        and raw_signal_start is not None
+        and pd.notna(raw_signal_start)
+        and raw_signal_start < stream_start
+    ):
+        fig.add_vrect(
+            x0=raw_signal_start,
+            x1=stream_start,
+            fillcolor=PARTIAL_STREAM_BAND_FILLCOLOR,
+            line_width=PARTIAL_STREAM_LINE_WIDTH,
+            line_color=PARTIAL_STREAM_LINE_COLOR,
+            line_dash=PARTIAL_STREAM_LINE_DASH,
+            row="all",
+            col=1,
+        )
+        fig.add_annotation(
+            x=raw_signal_start,
+            y=1,
+            xref="x",
+            yref="paper",
+            text=PARTIAL_STREAM_LABEL,
+            showarrow=False,
+            xanchor="left",
+            yanchor="bottom",
+            font=dict(color=PARTIAL_STREAM_LINE_COLOR, size=11),
+        )
+
+    if stream_start is not None and warmup_hours is not None:
+        warmup_limit = float(warmup_hours)
+        warmup_end = stream_start + pd.Timedelta(hours=warmup_limit)
+        if warmup_limit > 0:
+            fig.add_vrect(
+                x0=stream_start,
+                x1=warmup_end,
+                fillcolor=WARMUP_BAND_FILLCOLOR,
+                line_width=0,
+                row="all",
+                col=1,
+            )
+        fig.add_shape(
+            type="line",
+            x0=warmup_end,
+            x1=warmup_end,
+            y0=0,
+            y1=1,
+            xref="x",
+            yref="paper",
+            line=dict(
+                color=STRATUM_COLORS[WARMUP_ROLE],
+                width=WARMUP_END_LINE_WIDTH,
+                dash=WARMUP_END_LINE_DASH,
+            ),
+        )
+        fig.add_annotation(
+            x=warmup_end,
+            y=1,
+            xref="x",
+            yref="paper",
+            text=f"warm-up ends, {warmup_limit:g} h from stream start",
+            showarrow=False,
+            xanchor="left",
+            yanchor="bottom",
+            font=dict(color=STRATUM_COLORS[WARMUP_ROLE], size=11),
+        )
+
+    anchor_columns = {"anchor_timestamp", "hours_since_start", "segment_id", "anchor_time_idx"}
+    if anchor_df is not None and not anchor_df.empty and anchor_columns.issubset(anchor_df.columns):
+        anchor_work = anchor_df.copy()
+        anchor_work["anchor_timestamp"] = pd.to_datetime(
+            anchor_work["anchor_timestamp"], errors="coerce"
+        )
+        anchor_work["hours_since_segment_start"] = pd.to_numeric(
+            anchor_work["hours_since_start"], errors="coerce"
+        )
+        anchor_work["hours_since_stream_start"] = (
+            (anchor_work["anchor_timestamp"] - stream_start).dt.total_seconds() / 3600.0
+            if stream_start is not None
+            else np.nan
+        )
+        signal_at_time = pd.DataFrame({
+            "anchor_timestamp": pd.to_datetime(ts_df[time_col], errors="coerce"),
+            "_anchor_y": pd.to_numeric(ts_df[available[0]], errors="coerce"),
+        }).dropna(subset=["anchor_timestamp"]).drop_duplicates(
+            "anchor_timestamp", keep="first"
+        )
+        anchor_work = anchor_work.merge(signal_at_time, on="anchor_timestamp", how="left")
+        anchor_work = anchor_work.dropna(subset=["anchor_timestamp", "_anchor_y"])
+        if not anchor_work.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=anchor_work["anchor_timestamp"],
+                    y=anchor_work["_anchor_y"],
+                    mode="markers",
+                    name=ANCHOR_ROLE,
+                    marker=dict(
+                        color=STRATUM_COLORS[ANCHOR_ROLE],
+                        size=ANCHOR_MARKER_SIZE,
+                        opacity=ANCHOR_MARKER_OPACITY,
+                        symbol="circle",
+                    ),
+                    customdata=anchor_work[
+                        ["hours_since_stream_start", "hours_since_segment_start", "segment_id", "anchor_time_idx"]
+                    ].to_numpy(),
+                    hovertemplate=(
+                        "%{x}<br>Hours since stream start: %{customdata[0]:.2f}<br>"
+                        "Hours since segment start: %{customdata[1]:.2f}<br>"
+                        "Segment: %{customdata[2]}<br>Anchor index: %{customdata[3]}"
+                        f"<extra>{ANCHOR_ROLE}</extra>"
+                    ),
+                ),
+                row=1,
+                col=1,
+            )
 
     fig.update_xaxes(title="Time", tickformat="%b %d %H:%M", rangeslider_visible=False)
     fig.update_layout(hovermode="x unified", dragmode="zoom")
-    return style_fig(fig, height=max(650, 230 * len(available)), title="Participant signal timeline")
+    return style_fig(fig, height=max(650, 230 * len(available)), title=title)
 
 
 def plot_static_feature_table(static_row: pd.DataFrame, query: str = "") -> pd.DataFrame:
@@ -362,6 +472,43 @@ def plot_population_violin(df: pd.DataFrame, value_col: str, group_col: str | No
         fig.update_xaxes(title="")
     fig.update_yaxes(title=pretty_col(value_col))
     return style_fig(fig, height=430, title=title)
+
+
+def plot_cluster_box_strip(
+    df: pd.DataFrame,
+    value_col: str,
+    cluster_col: str,
+    cluster_order: list[str],
+    cluster_colors: dict[str, str],
+    title: str,
+):
+    """Box plot with jittered individual points, grouped by a frozen cluster label."""
+    values = _numeric_series(df, value_col)
+    if values.empty:
+        return empty_plot(f"No numeric values for {pretty_col(value_col)}")
+    tmp = df.copy()
+    tmp[value_col] = pd.to_numeric(tmp[value_col], errors="coerce")
+    tmp = tmp.dropna(subset=[value_col, cluster_col])
+    fig = px.box(
+        tmp,
+        x=cluster_col,
+        y=value_col,
+        color=cluster_col,
+        points="all",
+        category_orders={cluster_col: cluster_order},
+        color_discrete_map=cluster_colors,
+    )
+    fig.update_traces(
+        boxpoints="all",
+        jitter=0.4,
+        pointpos=0,
+        marker=dict(size=4, opacity=0.55),
+        line=dict(width=1.4),
+    )
+    fig.update_xaxes(title="")
+    fig.update_yaxes(title=pretty_col(value_col))
+    fig.update_layout(showlegend=False)
+    return style_fig(fig, height=380, title=title)
 
 
 def plot_stacked_histogram(df: pd.DataFrame, value_col: str, group_col: str | None, title: str, nbins: int = 35):
@@ -508,95 +655,6 @@ def plot_preprocessing_pipeline(pipeline_df: pd.DataFrame):
     fig.update_xaxes(visible=False, range=[-0.55, len(df) - 0.45])
     fig.update_yaxes(visible=False, range=[-0.55, 0.55])
     return style_fig(fig, height=430, title="Stage 1-4 preprocessing flow")
-
-
-def plot_forecast_window(
-    window_df: pd.DataFrame,
-    selected_position: int,
-    bin_minutes: float = 5.0,
-    target_hours: float = 1.0,
-    ts_df: pd.DataFrame | None = None,
-    time_col: str | None = None,
-):
-    if window_df is None or window_df.empty:
-        return empty_plot("No forecast windows available for this participant", height=760)
-    if not {"window_start", "window_end"}.issubset(window_df.columns):
-        return empty_plot("Forecast-window table needs window_start and window_end columns", height=760)
-
-    df = window_df.copy().reset_index(drop=True)
-    df["window_start"] = pd.to_numeric(df["window_start"], errors="coerce")
-    df["window_end"] = pd.to_numeric(df["window_end"], errors="coerce")
-    df = df.dropna(subset=["window_start", "window_end"]).reset_index(drop=True)
-    if df.empty:
-        return empty_plot("Forecast-window bounds could not be parsed", height=760)
-
-    selected_position = int(max(0, min(selected_position, len(df) - 1)))
-    row = df.iloc[selected_position]
-    start_bin = float(row["window_start"])
-    end_bin = float(row["window_end"])
-    target_bins = max(1.0, float(target_hours) * 60.0 / float(bin_minutes))
-    context_end_bin = max(start_bin, end_bin - target_bins)
-    start_h = start_bin * bin_minutes / 60.0
-    context_end_h = context_end_bin * bin_minutes / 60.0
-    end_h = end_bin * bin_minutes / 60.0
-
-    signal_cols = [col for col in SIGNAL_COLUMNS.values() if ts_df is not None and not ts_df.empty and col in ts_df.columns]
-    rows = 1 + max(1, len(signal_cols))
-    heights = [0.24] + [0.76 / max(1, len(signal_cols))] * max(1, len(signal_cols))
-    labels = {col: label for label, col in SIGNAL_COLUMNS.items()}
-    subplot_titles = ["Sliding windows: previous / current / next overlap"]
-    subplot_titles += [labels.get(c, pretty_col(c)) for c in signal_cols] if signal_cols else ["Selected window signal values unavailable"]
-    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=heights, subplot_titles=subplot_titles)
-
-    window_colors = {selected_position - 1: PALETTE[4], selected_position: PALETTE[1], selected_position + 1: PALETTE[2]}
-    window_names = {selected_position - 1: "Previous window", selected_position: "Current window", selected_position + 1: "Next window"}
-    for pos in [selected_position - 1, selected_position, selected_position + 1]:
-        if pos < 0 or pos >= len(df):
-            continue
-        wr = df.iloc[pos]
-        ws = float(wr["window_start"]) * bin_minutes / 60.0
-        we = float(wr["window_end"]) * bin_minutes / 60.0
-        fig.add_trace(go.Bar(
-            x=[we - ws], y=[window_names[pos]], base=[ws], orientation="h",
-            marker=dict(color=window_colors[pos], opacity=0.72, line=dict(color="rgba(0,51,102,0.35)", width=1)),
-            name=window_names[pos],
-            hovertemplate=f"{window_names[pos]}<br>Start: {ws:.2f} h<br>End: {we:.2f} h<extra></extra>",
-            showlegend=True,
-        ), row=1, col=1)
-
-    fig.add_vrect(x0=start_h, x1=context_end_h, fillcolor="rgba(0,51,102,0.07)", line_width=0, row="all", col=1)
-    fig.add_vrect(x0=context_end_h, x1=end_h, fillcolor="rgba(186,40,40,0.14)", line_width=0, row="all", col=1)
-    fig.add_vline(x=context_end_h, line_width=1.5, line_dash="dot", line_color=PALETTE[0], annotation_text="Target starts", annotation_position="top left")
-    fig.add_vline(x=end_h, line_width=2, line_dash="dash", line_color=PALETTE[3], annotation_text="Prediction timestamp", annotation_position="top right")
-
-    if signal_cols and ts_df is not None:
-        work = ts_df.copy().reset_index(drop=True)
-        work["_relative_h"] = np.arange(len(work)) * float(bin_minutes) / 60.0
-        selected = work[(work["_relative_h"] >= start_h) & (work["_relative_h"] <= end_h)].copy()
-        colors = [PALETTE[1], PALETTE[2], PALETTE[0], PALETTE[4]]
-        for idx, col in enumerate(signal_cols, start=2):
-            fig.add_trace(go.Scatter(
-                x=selected["_relative_h"], y=pd.to_numeric(selected[col], errors="coerce"),
-                mode="lines", line=dict(color=colors[(idx - 2) % len(colors)], width=1.7),
-                name=labels.get(col, pretty_col(col)), connectgaps=False,
-                hovertemplate="Relative time: %{x:.2f} h<br>Value: %{y:.2f}<extra>" + labels.get(col, pretty_col(col)) + "</extra>",
-            ), row=idx, col=1)
-            fig.update_yaxes(title_text=labels.get(col, pretty_col(col)), row=idx, col=1)
-    else:
-        fig.add_annotation(text="Loadable signal values were not available for this selected window.", x=(start_h + end_h) / 2, y=0.5, showarrow=False, row=2, col=1, font=dict(color=PALETTE[4]))
-
-    starts = pd.to_numeric(df["window_start"], errors="coerce").dropna().sort_values()
-    stride_bins = starts.diff().dropna().median() if len(starts) > 1 else np.nan
-    window_h = (end_bin - start_bin) * bin_minutes / 60.0
-    stride_h = stride_bins * bin_minutes / 60.0 if pd.notna(stride_bins) else np.nan
-    overlap_h = window_h - stride_h if pd.notna(stride_h) else np.nan
-    title = f"Forecast window {selected_position} - context {(context_end_h - start_h):.1f} h -> target {target_hours:g} h"
-    if pd.notna(stride_h):
-        title += f" - stride {stride_h:.1f} h - overlap {overlap_h:.1f} h"
-    fig.update_xaxes(title="Relative time from participant/segment start [hours]", row=rows, col=1)
-    fig.update_yaxes(title="", row=1, col=1)
-    fig.update_layout(barmode="overlay", hovermode="x unified")
-    return style_fig(fig, height=max(920, 245 * rows), title=title)
 
 
 def _flag_series(series: pd.Series) -> pd.Series:
