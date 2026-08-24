@@ -1,44 +1,60 @@
 """Configuration for the AI-READI CGM enriched dataset dashboard."""
-from pathlib import Path
 
-BASE_DATA_DIR = Path("/home/myriamcharfeddine/CGM/Data/")
-ENRICHED_DATASET_DIR = Path("/home/myriamcharfeddine/CGM/Data/enriched_multimodal/")
-EXPERIMENT_C_SPLIT_DIR = Path("/home/myriamcharfeddine/CGM/Data/experiment_c_split_adapt48h_seed42/")
-RESULTS_DIR = Path("/home/myriamcharfeddine/CGM/Data/results/")
-SSM_STREAM_OUTPUT_DIR = Path(
-    "/home/myriamcharfeddine/CGM/SSM-CGM/outputs/aireadi_stream_mamba_stateful_5epoch"
-)
-SSM_STREAM_VALIDATION_OUTPUT_DIR = Path(
-    "/home/myriamcharfeddine/CGM/SSM-CGM/outputs/aireadi_stream_mamba_stateful_10epoch_eval_validation"
-)
-SSM_STREAM_TEST_OUTPUT_DIR = Path(
-    "/home/myriamcharfeddine/CGM/SSM-CGM/outputs/aireadi_stream_mamba_stateful_10epoch_eval_test"
-)
+# Data is read from Google Cloud Storage rather than the local filesystem so
+# the dashboard can run on Streamlit Community Cloud. Every *_PREFIX below is
+# a path relative to gs://{GCS_BUCKET}/{GCS_PREFIX}/, resolved by the
+# read_parquet_from_gcs / read_csv_from_gcs helpers in data_loader.py.
+GCS_BUCKET = "cgmproject2025"
+GCS_PREFIX = "dashboard_data"
+
+# NOT currently present under gs://cgmproject2025/dashboard_data/ (verified
+# 2026-08-18) -- participants.tsv / condition_occurrence.csv have not been
+# uploaded yet. The demographic-balance tab will show its existing
+# "could not be loaded" warnings until this prefix exists in the bucket.
+CLINICAL_DATA_PREFIX = "clinical_data"
+ENRICHED_DATASET_PREFIX = "enriched_multimodal"
+EXPERIMENT_C_SPLIT_PREFIX = "experiment_c_split_adapt48h_seed42"
+# Unverified in the bucket; only backs detected_results(), which nothing in
+# app.py currently calls.
+RESULTS_PREFIX = "results"
+# The SSM-CGM model outputs are a separate local project (CGM/SSM-CGM/outputs/...)
+# from the CGM/Data/ tree the other prefixes above mirror, so they are
+# namespaced under ssm_cgm_outputs/ in the bucket.
+SSM_STREAM_OUTPUT_PREFIX = "ssm_cgm_outputs/aireadi_stream_mamba_stateful_5epoch"
+SSM_STREAM_VALIDATION_OUTPUT_PREFIX = "ssm_cgm_outputs/aireadi_stream_mamba_stateful_10epoch_eval_validation"
+SSM_STREAM_TEST_OUTPUT_PREFIX = "ssm_cgm_outputs/aireadi_stream_mamba_stateful_10epoch_eval_test"
 # Canonical participant split used to train the epoch-5 checkpoint at
-# SSM_STREAM_OUTPUT_DIR (see config_resolved.yaml: split.existing_split_path),
-# distinct from EXPERIMENT_C_SPLIT_DIR, which backs the retired windowed pipeline.
-CANONICAL_STREAM_SPLIT_DIR = Path("/home/myriamcharfeddine/CGM/Data/experiment_c_split_adapt6h_seed42/")
+# SSM_STREAM_OUTPUT_PREFIX -- confirmed via config_resolved.yaml
+# (split.existing_split_path) inside SSM_STREAM_OUTPUT_PREFIX in the bucket,
+# which still points at this exact relative path. Distinct from
+# EXPERIMENT_C_SPLIT_PREFIX, which backs the retired windowed pipeline.
+# NOT currently present under gs://cgmproject2025/dashboard_data/ (verified
+# 2026-08-18) -- kept as this exact path so the file starts working the
+# moment it's uploaded; until then, load_canonical_stream_split() returns
+# empty and every Train/Validation/Test label in the dashboard falls back to
+# the app's existing "canonical split could not be loaded" placeholder.
+CANONICAL_STREAM_SPLIT_PREFIX = "experiment_c_split_adapt6h_seed42"
 CANONICAL_STREAM_CHECKPOINT_VAL_PINBALL_MGDL = 3.286316
 # Frozen T2D oral non-insulin subtype clustering (C1/C2/C3) used in the
 # interpretability chapter; per-participant clinical factor values, long format.
-T2D_SUBTYPE_CLINICAL_FACTORS_PATH = Path(
-    "/home/myriamcharfeddine/CGM/SSM-CGM/outputs/static_phenotype_trajectory_stratified_v2/"
+T2D_SUBTYPE_CLINICAL_FACTORS_PATH = (
+    "ssm_cgm_outputs/static_phenotype_trajectory_stratified_v2/"
     "extended_clinical_latent_dynamics_v1/01_cluster_metabolic_profiles/figure_1A_plotted_data.csv"
 )
 T2D_SUBTYPE_STRATUM = "t2d_oral_non_insulin"
 
 EXPECTED_FILES = {
-    "final_multimodal_dataset*.parquet": ENRICHED_DATASET_DIR / "final_multimodal_dataset*.parquet",
-    "participant_static_features.parquet": ENRICHED_DATASET_DIR / "participant_static_features.parquet",
-    "cohort.csv": ENRICHED_DATASET_DIR / "cohort.csv",
-    "segments.csv": ENRICHED_DATASET_DIR / "segments.csv",
-    "forecast_windows.csv": ENRICHED_DATASET_DIR / "forecast_windows.csv",
-    "participant_measurements_selected_long.parquet": ENRICHED_DATASET_DIR / "participant_measurements_selected_long.parquet",
-    "participant_medications_long.parquet": ENRICHED_DATASET_DIR / "participant_medications_long.parquet",
-    "split_participants.csv": CANONICAL_STREAM_SPLIT_DIR / "split_participants.csv",
-    "forecast_windows_with_split.csv": EXPERIMENT_C_SPLIT_DIR / "forecast_windows_with_split.csv",
-    "val_personalization_windows.csv": EXPERIMENT_C_SPLIT_DIR / "val_personalization_windows.csv",
-    "test_personalization_windows.csv": EXPERIMENT_C_SPLIT_DIR / "test_personalization_windows.csv",
+    "final_multimodal_dataset*.parquet": f"{ENRICHED_DATASET_PREFIX}/final_multimodal_dataset*.parquet",
+    "participant_static_features.parquet": f"{ENRICHED_DATASET_PREFIX}/participant_static_features.parquet",
+    "cohort.csv": f"{ENRICHED_DATASET_PREFIX}/cohort.csv",
+    "segments.csv": f"{ENRICHED_DATASET_PREFIX}/segments.csv",
+    "forecast_windows.csv": f"{ENRICHED_DATASET_PREFIX}/forecast_windows.csv",
+    "participant_measurements_selected_long.parquet": f"{ENRICHED_DATASET_PREFIX}/participant_measurements_selected_long.parquet",
+    "participant_medications_long.parquet": f"{ENRICHED_DATASET_PREFIX}/participant_medications_long.parquet",
+    "split_participants.csv": f"{CANONICAL_STREAM_SPLIT_PREFIX}/split_participants.csv",
+    "forecast_windows_with_split.csv": f"{EXPERIMENT_C_SPLIT_PREFIX}/forecast_windows_with_split.csv",
+    "val_personalization_windows.csv": f"{EXPERIMENT_C_SPLIT_PREFIX}/val_personalization_windows.csv",
+    "test_personalization_windows.csv": f"{EXPERIMENT_C_SPLIT_PREFIX}/test_personalization_windows.csv",
 }
 
 PARTICIPANT_COL = "participant_id"

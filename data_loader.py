@@ -1,35 +1,30 @@
-"""Cached defensive loaders for enriched CGM data and Experiment C split artifacts."""
+"""Cached defensive loaders for enriched CGM data, read from Google Cloud Storage."""
 from __future__ import annotations
 
 import json
-import sys
-from pathlib import Path
 
+import gcsfs
 import pandas as pd
 import streamlit as st
 
 from config import (
-    BASE_DATA_DIR,
-    CANONICAL_STREAM_SPLIT_DIR,
+    CANONICAL_STREAM_SPLIT_PREFIX,
+    CLINICAL_DATA_PREFIX,
     CORE_TS_COLS,
-    ENRICHED_DATASET_DIR,
+    ENRICHED_DATASET_PREFIX,
     EXPECTED_FILES,
+    GCS_BUCKET,
+    GCS_PREFIX,
     PARTICIPANT_COL,
-    RESULTS_DIR,
-    SSM_STREAM_OUTPUT_DIR,
-    SSM_STREAM_TEST_OUTPUT_DIR,
-    SSM_STREAM_VALIDATION_OUTPUT_DIR,
+    RESULTS_PREFIX,
+    SSM_STREAM_OUTPUT_PREFIX,
+    SSM_STREAM_TEST_OUTPUT_PREFIX,
+    SSM_STREAM_VALIDATION_OUTPUT_PREFIX,
     T2D_SUBTYPE_CLINICAL_FACTORS_PATH,
     T2D_SUBTYPE_STRATUM,
     TIMESTAMP_CANDIDATES,
 )
-
-SSM_CGM_REPO_DIR = SSM_STREAM_OUTPUT_DIR.parents[1]
-SSM_CGM_REPO_DIR_TEXT = str(SSM_CGM_REPO_DIR)
-if SSM_CGM_REPO_DIR_TEXT not in sys.path:
-    sys.path.insert(0, SSM_CGM_REPO_DIR_TEXT)
-
-from Preprocessing.cohort_selection import (  # noqa: E402
+from vendored_cohort_selection import (
     CORE_COLS as SEGMENTATION_CORE_COLS,
     GAP_THRESHOLDS_MIN,
     _segment_participant,
@@ -38,7 +33,7 @@ from Preprocessing.cohort_selection import (  # noqa: E402
 CGM_SEGMENT_GAP_MINUTES = GAP_THRESHOLDS_MIN["cgm"]
 FORECAST_ANCHOR_HORIZON_STEP = 1
 FORECAST_ANCHOR_SCENARIO_MODE = "forecast_only"
-FORECAST_PREDICTIONS_RELATIVE_PATH = Path("predictions") / "predictions.parquet"
+FORECAST_PREDICTIONS_RELATIVE_PATH = "predictions/predictions.parquet"
 FORECAST_ANCHOR_COLUMNS = [
     PARTICIPANT_COL, "segment_id", "split", "anchor_time_idx",
     "anchor_timestamp", "hours_since_start", "scenario_mode", "horizon_step",
@@ -49,10 +44,45 @@ FORECAST_ANCHOR_KEY_COLUMNS = [
 SEGMENT_BOUNDARY_COLUMNS = ["segment_id", "start", "end"]
 
 
-def _size(path: Path) -> str:
+def _gcs_key(relative_path: str) -> str:
+    return f"{GCS_BUCKET}/{GCS_PREFIX}/{relative_path}"
+
+
+def _strip_gcs_prefix(key: str) -> str:
+    prefix = f"{GCS_BUCKET}/{GCS_PREFIX}/"
+    return key[len(prefix):] if key.startswith(prefix) else key
+
+
+@st.cache_resource(show_spinner=False)
+def _gcs_filesystem() -> gcsfs.GCSFileSystem:
+    return gcsfs.GCSFileSystem(token=dict(st.secrets["gcp_service_account"]))
+
+
+@st.cache_resource(show_spinner=False)
+def read_parquet_from_gcs(relative_path: str, columns: list[str] | None = None, filters=None) -> pd.DataFrame:
+    """Read a parquet object at gs://{GCS_BUCKET}/{GCS_PREFIX}/{relative_path}."""
+    with _gcs_filesystem().open(_gcs_key(relative_path), "rb") as f:
+        return pd.read_parquet(f, columns=columns, filters=filters)
+
+
+@st.cache_resource(show_spinner=False)
+def read_csv_from_gcs(relative_path: str, **kwargs) -> pd.DataFrame:
+    """Read a CSV/TSV object at gs://{GCS_BUCKET}/{GCS_PREFIX}/{relative_path}."""
+    with _gcs_filesystem().open(_gcs_key(relative_path), "rb") as f:
+        return pd.read_csv(f, **kwargs)
+
+
+def _gcs_exists(relative_path: str) -> bool:
     try:
-        value = float(path.stat().st_size)
-    except OSError:
+        return _gcs_filesystem().exists(_gcs_key(relative_path))
+    except Exception:
+        return False
+
+
+def _size(relative_path: str) -> str:
+    try:
+        value = float(_gcs_filesystem().info(_gcs_key(relative_path))["size"])
+    except Exception:
         return ""
     for unit in ["B", "KB", "MB", "GB"]:
         if value < 1024 or unit == "GB":
@@ -61,25 +91,28 @@ def _size(path: Path) -> str:
     return ""
 
 
-def _matches(pattern: Path) -> list[Path]:
-    s = str(pattern)
-    if any(ch in s for ch in "*?[]"):
-        return sorted(Path("/").glob(s.lstrip("/"))) if s.startswith("/") else sorted(Path().glob(s))
-    return [pattern] if pattern.exists() else []
+def _matches(relative_pattern: str) -> list[str]:
+    if any(ch in relative_pattern for ch in "*?[]"):
+        try:
+            found = sorted(_gcs_filesystem().glob(_gcs_key(relative_pattern)))
+        except Exception:
+            return []
+        return [_strip_gcs_prefix(p) for p in found]
+    return [relative_pattern] if _gcs_exists(relative_pattern) else []
 
 
 @st.cache_data(show_spinner=False)
 def check_file_availability() -> pd.DataFrame:
     rows = []
     for label, pattern in EXPECTED_FILES.items():
-        found = _matches(Path(pattern))
+        found = _matches(pattern)
         if found:
-            for path in found[:8]:
-                rows.append({"File": label, "Found/Missing": "✅ Found", "Path": str(path), "Size": _size(path)})
+            for relative_path in found[:8]:
+                rows.append({"File": label, "Found/Missing": "✅ Found", "Path": _gcs_key(relative_path), "Size": _size(relative_path)})
             if len(found) > 8:
                 rows.append({"File": label, "Found/Missing": f"✅ Found {len(found)} total", "Path": f"{len(found)-8} more not shown", "Size": ""})
         else:
-            rows.append({"File": label, "Found/Missing": "⚠️ Missing", "Path": str(pattern), "Size": ""})
+            rows.append({"File": label, "Found/Missing": "⚠️ Missing", "Path": _gcs_key(pattern), "Size": ""})
     return pd.DataFrame(rows)
 
 
@@ -87,54 +120,56 @@ def _warn(msg: str):
     st.warning(msg, icon="⚠️")
 
 
-def _csv(path: Path, **kwargs) -> pd.DataFrame:
+def _csv(relative_path: str, **kwargs) -> pd.DataFrame:
     try:
-        return pd.read_csv(path, **kwargs)
+        return read_csv_from_gcs(relative_path, **kwargs)
     except FileNotFoundError:
-        _warn(f"Missing file: {path}")
+        _warn(f"Missing file: {relative_path}")
     except Exception as exc:
-        _warn(f"Could not read {path}: {exc}")
+        _warn(f"Could not read {relative_path}: {exc}")
     return pd.DataFrame()
 
 
-def _parquet(path: Path, columns: list[str] | None = None, filters=None, max_rows: int | None = None) -> pd.DataFrame:
+def _parquet(relative_path: str, columns: list[str] | None = None, filters=None, max_rows: int | None = None) -> pd.DataFrame:
     try:
-        df = pd.read_parquet(path, columns=columns, filters=filters)
+        df = read_parquet_from_gcs(relative_path, columns=columns, filters=filters)
         return df.head(max_rows) if max_rows and len(df) > max_rows else df
     except FileNotFoundError:
-        _warn(f"Missing file: {path}")
+        _warn(f"Missing file: {relative_path}")
     except Exception as exc:
-        _warn(f"Could not read {path}: {exc}")
+        _warn(f"Could not read {relative_path}: {exc}")
     return pd.DataFrame()
 
 
-def _latest_multimodal() -> Path | None:
-    files = sorted(ENRICHED_DATASET_DIR.glob("final_multimodal_dataset*.parquet"))
+def _latest_multimodal() -> str | None:
+    files = _matches(f"{ENRICHED_DATASET_PREFIX}/final_multimodal_dataset*.parquet")
     return files[-1] if files else None
 
 
 @st.cache_data(show_spinner=False)
 def multimodal_metadata() -> dict:
-    path = _latest_multimodal()
-    if not path:
+    relative_path = _latest_multimodal()
+    if not relative_path:
         return {"path": None, "columns": [], "rows": None}
     try:
         import pyarrow.parquet as pq
-        pf = pq.ParquetFile(path)
-        return {"path": str(path), "columns": pf.schema.names, "rows": pf.metadata.num_rows, "row_groups": pf.num_row_groups}
+        with _gcs_filesystem().open(_gcs_key(relative_path), "rb") as f:
+            pf = pq.ParquetFile(f)
+            return {"path": relative_path, "columns": pf.schema.names, "rows": pf.metadata.num_rows, "row_groups": pf.num_row_groups}
     except Exception as exc:
         _warn(f"Could not inspect multimodal parquet metadata: {exc}")
-        return {"path": str(path), "columns": [], "rows": None}
+        return {"path": relative_path, "columns": [], "rows": None}
 
 
 @st.cache_data(show_spinner=False)
 def load_cohort_selection_metadata() -> dict:
-    path = ENRICHED_DATASET_DIR / "cohort_selection_metadata.json"
-    if not path.exists():
-        _warn(f"Missing file: {path}")
+    relative_path = f"{ENRICHED_DATASET_PREFIX}/cohort_selection_metadata.json"
+    if not _gcs_exists(relative_path):
+        _warn(f"Missing file: {relative_path}")
         return {}
     try:
-        return json.loads(path.read_text())
+        with _gcs_filesystem().open(_gcs_key(relative_path), "rb") as f:
+            return json.loads(f.read())
     except Exception as exc:
         _warn(f"Could not read cohort selection metadata: {exc}")
         return {}
@@ -143,15 +178,7 @@ def load_cohort_selection_metadata() -> dict:
 @st.cache_data(show_spinner=False)
 def load_original_participants() -> pd.DataFrame:
     """Load the original clinical participants.tsv file for source study-group checks."""
-    path = BASE_DATA_DIR / "clinical_data" / "participants.tsv"
-    try:
-        df = pd.read_csv(path, sep="\t")
-    except FileNotFoundError:
-        _warn(f"Missing file: {path}")
-        return pd.DataFrame()
-    except Exception as exc:
-        _warn(f"Could not read {path}: {exc}")
-        return pd.DataFrame()
+    df = _csv(f"{CLINICAL_DATA_PREFIX}/participants.tsv", sep="\t")
     if "person_id" in df.columns:
         df["participant_id"] = df["person_id"].astype(str)
     if "study_group" in df.columns:
@@ -162,15 +189,7 @@ def load_original_participants() -> pd.DataFrame:
 @st.cache_data(show_spinner=False)
 def load_original_condition_groups() -> pd.DataFrame:
     """Derive a compact self-reported diabetes-condition group from condition_occurrence.csv."""
-    path = BASE_DATA_DIR / "clinical_data" / "condition_occurrence.csv"
-    try:
-        df = pd.read_csv(path, usecols=["person_id", "condition_source_value"])
-    except FileNotFoundError:
-        _warn(f"Missing file: {path}")
-        return pd.DataFrame()
-    except Exception as exc:
-        _warn(f"Could not read {path}: {exc}")
-        return pd.DataFrame()
+    df = _csv(f"{CLINICAL_DATA_PREFIX}/condition_occurrence.csv", usecols=["person_id", "condition_source_value"])
     if df.empty:
         return pd.DataFrame()
     source = df["condition_source_value"].fillna("").astype(str).str.lower()
@@ -194,12 +213,12 @@ def load_original_condition_groups() -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_cohort() -> pd.DataFrame:
-    return _csv(ENRICHED_DATASET_DIR / "cohort.csv")
+    return _csv(f"{ENRICHED_DATASET_PREFIX}/cohort.csv")
 
 
 @st.cache_data(show_spinner=False)
 def load_segments() -> pd.DataFrame:
-    return _csv(ENRICHED_DATASET_DIR / "segments.csv")
+    return _csv(f"{ENRICHED_DATASET_PREFIX}/segments.csv")
 
 
 def segment_boundaries(
@@ -240,17 +259,17 @@ def segment_boundaries(
 @st.cache_data(show_spinner=False)
 def load_forecast_anchors() -> pd.DataFrame:
     """Load one timestamped marker per canonical validation or test forecast anchor."""
-    paths = [
-        output_dir / FORECAST_PREDICTIONS_RELATIVE_PATH
-        for output_dir in (SSM_STREAM_VALIDATION_OUTPUT_DIR, SSM_STREAM_TEST_OUTPUT_DIR)
+    relative_paths = [
+        f"{prefix}/{FORECAST_PREDICTIONS_RELATIVE_PATH}"
+        for prefix in (SSM_STREAM_VALIDATION_OUTPUT_PREFIX, SSM_STREAM_TEST_OUTPUT_PREFIX)
     ]
     frames = []
     filters = [
         ("horizon_step", "==", FORECAST_ANCHOR_HORIZON_STEP),
         ("scenario_mode", "==", FORECAST_ANCHOR_SCENARIO_MODE),
     ]
-    for path in paths:
-        frame = _parquet(path, columns=FORECAST_ANCHOR_COLUMNS, filters=filters)
+    for relative_path in relative_paths:
+        frame = _parquet(relative_path, columns=FORECAST_ANCHOR_COLUMNS, filters=filters)
         if not frame.empty:
             frames.append(frame)
     if not frames:
@@ -271,11 +290,11 @@ def load_forecast_anchors() -> pd.DataFrame:
     ).reset_index(drop=True)
 
 
-def _stream_anchor_count(path: Path) -> int | None:
+def _stream_anchor_count(relative_path: str) -> int | None:
     """Count anchors once per stream, never once per horizon/scenario row."""
     try:
-        df = pd.read_csv(path)
-    except (FileNotFoundError, OSError, pd.errors.ParserError):
+        df = read_csv_from_gcs(relative_path)
+    except Exception:
         return None
     if df.empty or "n_anchors" not in df.columns:
         return None
@@ -294,16 +313,17 @@ def load_stream_summary() -> dict:
     """Load stateful SSM-CGM stream and true forecast-anchor totals."""
     stream_count = None
     try:
-        segment_df = pd.read_csv(ENRICHED_DATASET_DIR / "segments.csv")
+        segment_df = read_csv_from_gcs(f"{ENRICHED_DATASET_PREFIX}/segments.csv")
         stream_cols = [c for c in ["participant_id", "segment_id"] if c in segment_df.columns]
         stream_count = int(segment_df.drop_duplicates(stream_cols).shape[0]) if stream_cols else int(len(segment_df))
-    except (FileNotFoundError, OSError, pd.errors.ParserError):
+    except Exception:
         pass
 
     train_anchors = validation_anchors = None
-    training_path = SSM_STREAM_OUTPUT_DIR / "metrics" / "training_summary.json"
+    training_relative_path = f"{SSM_STREAM_OUTPUT_PREFIX}/metrics/training_summary.json"
     try:
-        training_summary = json.loads(training_path.read_text())
+        with _gcs_filesystem().open(_gcs_key(training_relative_path), "rb") as f:
+            training_summary = json.loads(f.read())
         history = training_summary.get("history", [])
         if history:
             latest = history[-1]
@@ -312,9 +332,9 @@ def load_stream_summary() -> dict:
     except (FileNotFoundError, OSError, ValueError, KeyError, TypeError):
         pass
 
-    validation_memory = SSM_STREAM_VALIDATION_OUTPUT_DIR / "hardware" / "stream_state_memory.csv"
+    validation_memory = f"{SSM_STREAM_VALIDATION_OUTPUT_PREFIX}/hardware/stream_state_memory.csv"
     validation_anchors = validation_anchors or _stream_anchor_count(validation_memory)
-    test_memory = SSM_STREAM_TEST_OUTPUT_DIR / "hardware" / "stream_state_memory.csv"
+    test_memory = f"{SSM_STREAM_TEST_OUTPUT_PREFIX}/hardware/stream_state_memory.csv"
     test_anchors = _stream_anchor_count(test_memory)
 
     split_counts = [train_anchors, validation_anchors, test_anchors]
@@ -332,15 +352,15 @@ def load_stream_summary() -> dict:
 def load_canonical_stream_split() -> pd.DataFrame:
     """Load the single source of truth for participant split assignment.
 
-    Sourced from CANONICAL_STREAM_SPLIT_DIR, referenced as
+    Sourced from CANONICAL_STREAM_SPLIT_PREFIX, referenced as
     split.existing_split_path in the checkpoint's config_resolved.yaml, this
     is the actual split the canonical streaming checkpoint was trained and
     evaluated on, and the same split forecast anchor computation uses. Every
     Train/Validation/Test label shown anywhere in the dashboard must be
-    derived from this loader; EXPERIMENT_C_SPLIT_DIR backs the retired
+    derived from this loader; EXPERIMENT_C_SPLIT_PREFIX backs the retired
     windowed-forecasting pipeline and no longer matches the streaming model.
     """
-    return _csv(CANONICAL_STREAM_SPLIT_DIR / "split_participants.csv")
+    return _csv(f"{CANONICAL_STREAM_SPLIT_PREFIX}/split_participants.csv")
 
 
 @st.cache_data(show_spinner=False)
@@ -363,18 +383,19 @@ def load_t2d_subtype_clinical_factors() -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_static_features() -> pd.DataFrame:
-    p = ENRICHED_DATASET_DIR / "participant_static_features.parquet"
-    if p.exists():
-        return _parquet(p)
-    return _csv(ENRICHED_DATASET_DIR / "participant_static_features.csv")
+    relative_parquet = f"{ENRICHED_DATASET_PREFIX}/participant_static_features.parquet"
+    if _gcs_exists(relative_parquet):
+        return _parquet(relative_parquet)
+    return _csv(f"{ENRICHED_DATASET_PREFIX}/participant_static_features.csv")
 
 
 @st.cache_data(show_spinner=False)
 def load_measurements_long(participant_id: str | None = None, max_rows: int = 10000) -> pd.DataFrame:
-    p = ENRICHED_DATASET_DIR / "participant_measurements_selected_long.parquet"
-    c = ENRICHED_DATASET_DIR / "participant_measurements_selected_long.csv"
-    filters = [(PARTICIPANT_COL, "=", str(participant_id))] if participant_id and p.exists() else None
-    df = _parquet(p, filters=filters, max_rows=max_rows) if p.exists() else _csv(c, nrows=max_rows)
+    relative_parquet = f"{ENRICHED_DATASET_PREFIX}/participant_measurements_selected_long.parquet"
+    relative_csv = f"{ENRICHED_DATASET_PREFIX}/participant_measurements_selected_long.csv"
+    parquet_exists = _gcs_exists(relative_parquet)
+    filters = [(PARTICIPANT_COL, "=", str(participant_id))] if participant_id and parquet_exists else None
+    df = _parquet(relative_parquet, filters=filters, max_rows=max_rows) if parquet_exists else _csv(relative_csv, nrows=max_rows)
     if participant_id and PARTICIPANT_COL in df.columns:
         df = df[df[PARTICIPANT_COL].astype(str) == str(participant_id)].head(max_rows)
     return df
@@ -382,10 +403,11 @@ def load_measurements_long(participant_id: str | None = None, max_rows: int = 10
 
 @st.cache_data(show_spinner=False)
 def load_medications_long(participant_id: str | None = None, max_rows: int = 10000) -> pd.DataFrame:
-    p = ENRICHED_DATASET_DIR / "participant_medications_long.parquet"
-    c = ENRICHED_DATASET_DIR / "participant_medications_long.csv"
-    filters = [(PARTICIPANT_COL, "=", str(participant_id))] if participant_id and p.exists() else None
-    df = _parquet(p, filters=filters, max_rows=max_rows) if p.exists() else _csv(c, nrows=max_rows)
+    relative_parquet = f"{ENRICHED_DATASET_PREFIX}/participant_medications_long.parquet"
+    relative_csv = f"{ENRICHED_DATASET_PREFIX}/participant_medications_long.csv"
+    parquet_exists = _gcs_exists(relative_parquet)
+    filters = [(PARTICIPANT_COL, "=", str(participant_id))] if participant_id and parquet_exists else None
+    df = _parquet(relative_parquet, filters=filters, max_rows=max_rows) if parquet_exists else _csv(relative_csv, nrows=max_rows)
     if participant_id and PARTICIPANT_COL in df.columns:
         df = df[df[PARTICIPANT_COL].astype(str) == str(participant_id)].head(max_rows)
     return df
@@ -404,8 +426,8 @@ def detect_timestamp_column(df: pd.DataFrame) -> str | None:
 
 @st.cache_data(show_spinner=True)
 def load_participant_timeseries(participant_id: str, max_rows: int = 60000) -> pd.DataFrame:
-    path = _latest_multimodal()
-    if not path:
+    relative_path = _latest_multimodal()
+    if not relative_path:
         _warn("No final_multimodal_dataset*.parquet found.")
         return pd.DataFrame()
     meta = multimodal_metadata()
@@ -418,10 +440,10 @@ def load_participant_timeseries(participant_id: str, max_rows: int = 60000) -> p
         return pd.DataFrame()
     filters = [(PARTICIPANT_COL, "=", str(participant_id))] if PARTICIPANT_COL in available_cols else None
     try:
-        df = pd.read_parquet(path, columns=cols, filters=filters)
+        df = read_parquet_from_gcs(relative_path, columns=cols, filters=filters)
     except Exception as exc:
         _warn(f"Filtered parquet read failed; trying a limited fallback. Details: {exc}")
-        df = _parquet(path, columns=cols, max_rows=max_rows)
+        df = _parquet(relative_path, columns=cols, max_rows=max_rows)
         if PARTICIPANT_COL in df.columns:
             df = df[df[PARTICIPANT_COL].astype(str) == str(participant_id)]
     if len(df) > max_rows:
@@ -439,8 +461,8 @@ def load_participant_timeseries(participant_id: str, max_rows: int = 60000) -> p
 @st.cache_data(show_spinner=False)
 def load_cgm_participant_metrics() -> pd.DataFrame:
     """Compute participant-level CGM summaries from the enriched multimodal parquet."""
-    path = _latest_multimodal()
-    if not path:
+    relative_path = _latest_multimodal()
+    if not relative_path:
         _warn("No final_multimodal_dataset*.parquet found for CGM-derived population metrics.")
         return pd.DataFrame()
     meta = multimodal_metadata()
@@ -450,7 +472,7 @@ def load_cgm_participant_metrics() -> pd.DataFrame:
         _warn("CGM-derived population metrics require participant_id and cgm_glucose_mean in the multimodal parquet.")
         return pd.DataFrame()
     try:
-        df = pd.read_parquet(path, columns=needed)
+        df = read_parquet_from_gcs(relative_path, columns=needed)
     except Exception as exc:
         _warn(f"Could not compute CGM-derived population metrics: {exc}")
         return pd.DataFrame()
@@ -475,11 +497,18 @@ def load_cgm_participant_metrics() -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def detected_results() -> dict[str, pd.DataFrame]:
-    folders = [p for p in RESULTS_DIR.iterdir() if p.is_dir()] if RESULTS_DIR.exists() else []
-    checkpoints = list(RESULTS_DIR.rglob("checkpoints/*.ckpt")) if RESULTS_DIR.exists() else []
-    metrics = list(RESULTS_DIR.rglob("metrics.csv")) if RESULTS_DIR.exists() else []
+    try:
+        prefix_key = _gcs_key(RESULTS_PREFIX)
+        checkpoints = sorted(_gcs_filesystem().glob(f"{prefix_key}/**/checkpoints/*.ckpt"))
+        metrics = sorted(_gcs_filesystem().glob(f"{prefix_key}/**/metrics.csv"))
+    except Exception:
+        checkpoints, metrics = [], []
+    folders = sorted(
+        {p.rsplit("/checkpoints/", 1)[0] for p in checkpoints}
+        | {p.rsplit("/", 1)[0] for p in metrics}
+    )
     return {
-        "folders": pd.DataFrame({"result_folder": [str(p) for p in folders]}),
-        "checkpoints": pd.DataFrame({"checkpoint": [str(p) for p in checkpoints]}),
-        "metrics": pd.DataFrame({"metrics_csv": [str(p) for p in metrics]}),
+        "folders": pd.DataFrame({"result_folder": folders}),
+        "checkpoints": pd.DataFrame({"checkpoint": checkpoints}),
+        "metrics": pd.DataFrame({"metrics_csv": metrics}),
     }
