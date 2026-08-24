@@ -4,8 +4,6 @@ A password-protected Streamlit dashboard for the CGM thesis project. It covers t
 
 
 
-No code, content, or folder structure is copied from either reference.
-
 ## Data source: Google Cloud Storage
 
 The dashboard does **not** read from the local filesystem. All data is loaded from GCS so the app can run on Streamlit Community Cloud, from `gs://cgmproject2025/dashboard_data/`, with each dataset under its own prefix (see [config.py](config.py)):
